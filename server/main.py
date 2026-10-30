@@ -32,7 +32,7 @@ logging.basicConfig(
     level=logging.DEBUG,  # Change to DEBUG for more detailed logs
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(),  # Output to console
+        logging.StreamHandler(sys.stderr),  # Keep stdout reserved for MCP messages
         logging.FileHandler(str(Path(__file__).with_name('altium_mcp.log')))  # Also log to file
     ]
 )
@@ -219,7 +219,6 @@ class AltiumConfig:
                         if os.path.exists(potential_exe):
                             self.altium_exe_path = potential_exe
                             logger.info(f"Automatically found Altium at: {self.altium_exe_path}")
-                            print(f"Automatically found Altium at: {self.altium_exe_path}")
                             paths_verified = True
                             break
             
@@ -231,11 +230,12 @@ class AltiumConfig:
                     root = tk.Tk()
                     root.withdraw()  # Hide the main window
                 
-                logger.info("Altium executable not found. Prompting user for selection...")
-                print(f"Altium executable not found. Searched in:")
-                print(f"  - Automatically scanned C:\\Program Files\\Altium\\AD*\\X2.EXE")
-                print(f"  - Last known path: {self.altium_exe_path}")
-                print("Please select the Altium X2.EXE file...")
+                logger.info(
+                    "Altium executable not found. Searched in %s; last known path: %s. "
+                    "Please select the Altium X2.EXE file...",
+                    r"C:\Program Files\Altium\AD*\X2.EXE",
+                    self.altium_exe_path,
+                )
                 
                 self.altium_exe_path = filedialog.askopenfilename(
                     title="Select Altium Executable",
@@ -244,8 +244,7 @@ class AltiumConfig:
                 )
                 
                 if not self.altium_exe_path:
-                    logger.error("No Altium executable selected. Some functionality may not work.")
-                    print("Warning: No Altium executable selected. Automatic script execution will be disabled.")
+                    logger.error("No Altium executable selected. Automatic script execution will be disabled.")
                     paths_verified = False
         
         # Check script path
@@ -259,7 +258,6 @@ class AltiumConfig:
                 root.withdraw()  # Hide the main window
             
             logger.info(f"Script file not found at {self.script_path}. Prompting user for selection...")
-            print(f"Script file not found at {self.script_path}. Please select the Altium project file...")
             
             selected_path = filedialog.askopenfilename(
                 title="Select Altium Project File",
@@ -271,7 +269,6 @@ class AltiumConfig:
                 self.script_path = selected_path
             else:
                 logger.error("No script file selected. Some functionality may not work.")
-                print("Warning: No script file selected. Please make sure to create one.")
                 paths_verified = False
         
         # Clean up tkinter root if created
@@ -529,12 +526,10 @@ class AltiumBridge:
         """Run the Altium bridge script"""
         if not os.path.exists(self.config.altium_exe_path):
             logger.error(f"Altium executable not found at: {self.config.altium_exe_path}")
-            print(f"Error: Altium executable not found. Please check the configuration.")
             return False
 
         if not os.path.exists(self.config.script_path):
             logger.error(f"Script file not found at: {self.config.script_path}")
-            print(f"Error: Script file not found. Please check the configuration.")
             return False
 
         try:
@@ -3124,11 +3119,11 @@ if __name__ == "__main__":
     
     # Verify configuration before starting
     if not altium_bridge.config.verify_paths():
-        print("Warning: Configuration not complete. Some functionality may not work.")
+        logger.warning("Configuration not complete. Some functionality may not work.")
     
-    # Print status
-    print(f"Altium executable: {altium_bridge.config.altium_exe_path}")
-    print(f"Script path: {altium_bridge.config.script_path}")
+    # Log status to stderr, leaving stdout for the MCP transport
+    logger.info(f"Altium executable: {altium_bridge.config.altium_exe_path}")
+    logger.info(f"Script path: {altium_bridge.config.script_path}")
     
     # Run the server
     mcp.run(transport='stdio')
