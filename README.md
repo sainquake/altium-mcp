@@ -20,6 +20,7 @@ This Model Context Protocol (MCP) server exposes tools for inspecting and editin
 - Get me all length matching rules
 - Check my project is ready for fabrication: unsaved documents, ERC errors, and which layers my Gerber output job plots
 - Draw a schematic of an LED with a current-limiting resistor on a new sheet, using symbols from my library
+- Edit an existing schematic sheet: add, update or delete components, wires, labels and ports without saving it
 
 ## Installing the MCP Server
 
@@ -144,6 +145,7 @@ The server provides several tools to interact with Altium Designer:
 - `get_symbol_primitives`: Inventory a .SchLib (every symbol with per-type primitive counts) or dump one symbol's complete geometry (all graphics + pin details, in mils; `symbol_name="*"` dumps every symbol). Used to gap-analyze a library, to give the agent a reference example when drawing a new symbol, and to verify recreations. The symbol creator round-trips a complete production library set exactly - 514/514 symbols across IC, connector, misc, and passives libraries (dump -> recreate -> dump -> diff, zero differences). Footprint/model links (implementations) are metadata outside the graphics round-trip.
 - `create_symbols_batch`: Create many symbols in one script run from a plain-text spec file (bulk imports/migrations) - far faster and more robust than one create call per symbol.
 - `build_schematic`: Build a wired schematic on a new sheet from a circuit description: parts from a `.SchLib` (full path; `.IntLib` is not supported), wires, junctions, net labels, power ports and notes, in mils. Returns every placed pin's true connection point, so a second call can route wires from measured coordinates, and lists any part it could not place. The new sheet is kept out of your project.
+- `edit_schematic(sheet_path, operations)`: Add, update and delete components, wires, net labels, ports, power ports, junctions and text on one exact existing `.SchDoc`. Never saves. Use `operations=[]` to read object UIDs and measured component pin connection points, then target edits by UID (or component designator). Components can be cloned from the sheet or placed from a `.SchLib`. Checks every target/source before applying the batch and reports partial API failures. See [operation schema, examples and verification](dev/EDIT_SCHEMATIC.md).
 - `get_symbol_placement_rules`: Create symbol's helper tool that reads `server\symbol_placement_rules.txt` in the server's installation directory to get pin placement rules for symbol creation.
 - `get_library_symbol_reference`: Create symbol's helper tool to use an open library symbol as an example to create the symbol
 - `search_library_symbol`: Search for a symbol by name in a schematic library (.SchLib) and navigate to it. Supports partial name matching. Will open the library file in Altium if a path is provided, or show a file picker if not.

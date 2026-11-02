@@ -26,6 +26,7 @@ import uuid
 from altium_files import read_altium_text, write_altium_text
 import sandbox
 from outjob_parser import parse_outjob
+from schematic_editor import validate_request as validate_schematic_edit
 
 # Configure logging
 logging.basicConfig(
@@ -1806,6 +1807,54 @@ async def build_schematic(ctx: Context, parts: list, wires: list = None,
     result["pin_map_note"] = ("Absolute electrical connection points. Route "
                               "wires from these, not from predicted offsets.")
     return json.dumps(result, indent=2)
+
+@mcp.tool()
+async def edit_schematic(ctx: Context, sheet_path: str, operations: list) -> str:
+    """Add, update or delete objects on an exact existing .SchDoc, in memory.
+
+    Never saves documents. operations=[] reads the sheet's objects and UIDs.
+    Each operation: {"op":"add|update|delete", "type":"component|wire|net_label|
+    port|power_port|junction|text", "target":{"unique_id":"..."},
+    "properties":{...}}. For components target may instead be {"designator":"R1"}.
+    Omit target for add and properties for delete. One edit per target per batch.
+
+    Properties (all coordinates in mils): component: x,y,orientation(0..3),
+    mirror(bool),designator,comment,description,parameters({name:string}). Add a
+    component with source_designator (clone on this sheet), OR symbol_library
+    (existing .SchLib) and symbol. Symbol sources are add-only. wire: points
+    ([x1,y1,x2,y2,...], full replacement). net_label/text: x,y,text,orientation.
+    port: x,y,name,io_type(0..3),style(0..7),width. power_port: x,y,text,
+    orientation,style(0..10),show_net_name(bool). junction: x,y. Add needs x/y
+    (or wire points), plus component designator, port name or label text.
+
+    Validates all targets/sources before editing. API errors may leave partial
+    edits: inspect applied_count, failed_index and may_have_partial_changes;
+    do not blindly retry. Returns results with UIDs and current objects,
+    including component pin electrical connection points for subsequent wiring.
+    Moving a component does not reroute attached wires. Read
+    dev/SCHEMATIC_CONVENTIONS.md before routing. Use fresh UIDs from this sheet.
+    """
+    try:
+        spec = validate_schematic_edit(sheet_path, operations)
+    except (ValueError, TypeError, OSError) as exc:
+        return json.dumps({"success": False, "error": str(exc), "applied_count": 0,
+                           "saved": False}, ensure_ascii=False)
+    # Unique files prevent queued calls from overwriting one another's input.
+    spec_path = EXCHANGE_DIR / f"schematic_edit_{uuid.uuid4().hex}.txt"
+    try:
+        write_altium_text(spec_path, spec)
+        response = await altium_bridge.execute_command("edit_schematic", {"spec_file": str(spec_path)})
+        if not response.get("success", False):
+            return json.dumps({"success": False, "error": response.get("error", "bridge failed"),
+                               "saved": False, "may_have_partial_changes": bool(operations),
+                               "spec_file": str(spec_path)})
+        result = response.get("result", {})
+        return result if isinstance(result, str) else json.dumps(result, indent=2, ensure_ascii=False)
+    finally:
+        # Keep a timed-out request's spec: a late-starting script still needs it.
+        if 'response' in locals() and response.get("success", False):
+            spec_path.unlink(missing_ok=True)
+
 
 @mcp.tool()
 async def create_symbols_batch(ctx: Context, spec_file: str) -> str:

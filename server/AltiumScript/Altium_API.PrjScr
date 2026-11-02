@@ -133,6 +133,10 @@ DItemRevisionGUID=
 GenerateClassCluster=0
 DocumentUniqueId=
 
+[Document7]
+DocumentPath=schematic_editor.pas
+AnnotationEnabled=1
+
 [Document6]
 DocumentPath=json_utils.pas
 AnnotationEnabled=1
