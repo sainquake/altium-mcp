@@ -90,8 +90,31 @@ def _clear_script_stuck():
     except OSError:
         pass
 
+# Instructions exposed to MCP clients during initialization.
+AGENT_INSTRUCTIONS = """Prefer dedicated Altium MCP tools. Before using custom DelphiScript through
+run_altium_script for a new operation, tell the user in their language what
+operation needs a script, why the available tools cannot cover it, and a proposed
+reusable tool name. This is a progress update: continue within the user's existing
+authorization. After execution, report whether the operation succeeded or failed.
+
+Check the available tool descriptions before declaring a capability missing.
+Distinguish a missing tool or unsupported parameter from a workaround for an
+existing tool's error and from API exploration. Group retries of the same
+operation under one announcement unless the purpose or scope changes.
+
+At the end of the task, include a concise, deduplicated list of operations that
+needed custom scripts: operation, reason, proposed permanent tool with its main
+arguments, and outcome. The user uses this list to plan additions to the MCP.
+Only include operations actually attempted; do not call a capability missing when
+an existing dedicated tool covers it.
+"""
+
 # Initialize FastMCP server
-mcp = FastMCP("AltiumMCP", description="Altium integration through the Model Context Protocol")
+mcp = FastMCP(
+    "AltiumMCP",
+    instructions=AGENT_INSTRUCTIONS,
+    description="Altium integration through the Model Context Protocol",
+)
 
 class AltiumConfig:
     def __init__(self):
@@ -1312,6 +1335,15 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
     """
     Run a DelphiScript snippet inside an isolated Altium sandbox and report
     what happened, step by step.
+
+    Agent disclosure: before using this tool for a new operation, tell the user
+    in their language what needs custom DelphiScript, why the dedicated tools
+    cannot cover it, and a proposed permanent tool name. This is a progress
+    update; continue within the user's existing authorization. Group retries
+    of the same operation under one announcement. Report the outcome afterwards
+    and include a deduplicated list of these operations, reasons, proposed tool
+    signatures and outcomes in the final response. Distinguish missing features
+    from existing-tool errors and API exploration; check the catalog first.
 
     Use this to develop and verify Altium API code before relying on it.
     Each call writes the script into a fresh copy of SandboxScript/Sandbox.pas
