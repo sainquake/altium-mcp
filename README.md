@@ -1,12 +1,12 @@
 # Altium MCP Server
 
-TLDR: Use Claude to control or ask questions about your Altium project.
-This is a Model Context Protocol (MCP) server that provides an interface to interact with Altium Designer through Python. The server allows for querying and manipulation of PCB designs programmatically.
+Control and query Altium Designer through an MCP client that supports local stdio servers.
+This Model Context Protocol (MCP) server exposes tools for inspecting and editing PCB designs, schematics, and libraries through Python and Altium's scripting interface. It runs on Windows and is independent of the agent or model provider.
 
 ## Example commands
 - Run all output jobs
 - Create a symbol for the part in the attached datasheet and use the currently open symbol as a reference example.
-- Create a schematic symbol from the attached MPM3650 switching regulator datasheet and make sure to strictly follow the symbol placement rules. (Note: Need to open a schematic library. Uses `server\symbol_placement_rules.txt` in the extension's install folder as pin placement rules. Please modify for your own preferences; an extension update replaces the file, so keep a copy.)
+- Create a schematic symbol from the attached MPM3650 switching regulator datasheet and make sure to strictly follow the symbol placement rules. (Note: Need to open a schematic library. Uses `server\symbol_placement_rules.txt` in the server's installation directory as pin placement rules. Please modify for your own preferences; an update can replace the file, so keep a copy.)
 - Create an op-amp symbol with a triangle body like the other op-amps in my library (symbols support line/polygon/arc/ellipse/label body graphics, not just rectangles)
 - Find me the LM358 symbol in my opamp library and open it
 - Create a multi-part symbol for a quad op-amp from the attached LM324 datasheet (creates parts A, B, C, D with shared V+/V- power pins)
@@ -22,44 +22,60 @@ This is a Model Context Protocol (MCP) server that provides an interface to inte
 - Draw a schematic of an LED with a current-limiting resistor on a new sheet, using symbols from my library
 
 ## Installing the MCP Server
-The easiest way to install is to use Claude Code, point it to this repo and ask it to install it for you. Or alternatively, see below.
 
-[Watch on YouTube](https://youtu.be/HKQMK-hluLs)
+1. Install Python 3.10+ on Windows and make sure it is available to your MCP client.
+2. Clone or download this repository to a local directory.
+3. Configure your MCP client to launch `start_server.py` with Python using the stdio transport. Use an absolute path to the script. If Python is not on the client's PATH, use the full path to `python.exe` as the command.
 
-1. Make sure Claude has Python 3.10+ installed: `drop down > File > Settings > Extensions > Advanced > Python`. If not, install Python and add it to PATH.
-2. Download the `altium-mcp.dxt` desktop extension file from [releases](https://github.com/coffeenmusic/altium-mcp/releases)
-3. In Claude Desktop on Windows: `drop down > File > Settings > Extensions > Advanced > Install Extension...` Select the .dxt file
+For clients that use an `mcpServers` configuration, a typical entry looks like this. Other clients may use a different configuration format; the launch command and arguments are the same.
 
-You shouldn't need to restart Claude and you should now see altium-mcp in the tool menu near the search bar.
+```json
+{
+  "mcpServers": {
+    "altium-mcp": {
+      "command": "python",
+      "args": ["C:/path/to/altium-mcp/start_server.py"]
+    }
+  }
+}
+```
 
-![altium-mcp in the tools menu](assets/extension.jpg)
+Replace the example path with your repository location, then enable or reload the server in your client. Call `get_server_status` to check that the server is connected and Altium was found.
 
-## Creating a new .dxt (For Developers)
+The launcher creates a virtual environment and installs dependencies on first use, which requires network access. To prepare it before connecting the client, run this from the repository directory:
 
-### Bootstrap Venv (Recommended)
+```powershell
+python start_server.py --build
+```
 
-This approach ships a small bootstrap script (`start_server.py`) that creates a virtual environment and pip-installs dependencies on the user's machine at first launch. The .dxt is tiny (~60 KB) and works across any Python 3.10+ version.
+Use the same Python interpreter and `ALTIUM_MCP_HOME` setting as the client. If a first launch exceeds the client's startup timeout, the detached build continues in the background; reconnect after it finishes. Build progress is recorded in `%USERPROFILE%\.altium-mcp\build.log` (or the directory set by `ALTIUM_MCP_HOME`).
 
-The older approach of bundling pre-compiled packages in `server/lib/` is no longer recommended — it breaks when the user's Python version doesn't match the version used to build the bundled `.pyd` files (e.g. pydantic_core compiled for 3.11 fails on 3.13).
+Clients that support `.dxt` desktop extensions can alternatively install `altium-mcp.dxt` from [releases](https://github.com/coffeenmusic/altium-mcp/releases) using their extension installer.
+
+## Launcher and Dependency Environment
+
+`start_server.py` creates a virtual environment and pip-installs dependencies on the user's machine at first launch. This avoids bundling pre-compiled packages in `server/lib/`, which can fail when the user's Python version differs from the version used to build the bundled `.pyd` files.
 
 **How it works:**
 
 1. `start_server.py` (at the repo root) looks for a ready virtual environment in `%USERPROFILE%\.altium-mcp\venvs\<key>`, where `<key>` is a hash of the pinned requirements and the Python version
-2. If it isn't ready, it starts a **detached** builder process (`start_server.py --build`) that creates the venv and pip-installs the dependencies, then waits for it. It installs the hash-locked `requirements.txt` when the package contains it, and falls back to the short `REQUIREMENTS` list in `start_server.py` when the file is missing or the locked wheels don't fit the interpreter. Claude Desktop kills a server that has not answered within about 60 seconds, and restarts servers freely; a build that ran inside the launcher died with it. The detached builder finishes regardless, so a restarted launcher finds the venv ready or a build still in progress.
+2. If it isn't ready, it starts a **detached** builder process (`start_server.py --build`) that creates the venv and pip-installs the dependencies, then waits for it. It installs the hash-locked `requirements.txt` when present, and falls back to the short `REQUIREMENTS` list in `start_server.py` when the file is missing or the locked dependencies cannot be installed for the interpreter. Separating the build from the launcher lets it continue if a client stops or restarts the server during setup.
 3. A lock file (holding the builder's PID) makes sure only one build runs at a time; other launchers wait for it. A lock whose owner has exited is taken over immediately.
 4. It then launches `server/main.py` using the venv's Python
-5. First launch takes ~20-30 seconds; subsequent launches are instant
+5. Subsequent launches reuse the environment while the requirements and Python version remain unchanged
 
-The venv, `config.json` and `build.log` live in `%USERPROFILE%\.altium-mcp`, not in the extension folder, because Claude Desktop replaces the extension folder on every update. The slow build therefore happens once per machine (and again only when the requirements or Python version change), and a hand-picked Altium path survives updates. AppData is deliberately avoided: Claude Desktop is an MSIX package, and writes its child processes make under AppData are redirected into `...\Packages\Claude_...\LocalCache`, so a venv built from a terminal and one built by the server would end up in different places. Set the `ALTIUM_MCP_HOME` environment variable to use a different folder. A `config.json` left beside `server/main.py` by an older version is migrated automatically on first start.
+The venv, `config.json` and `build.log` live in `%USERPROFILE%\.altium-mcp`, outside the installation directory, so dependency environments and a hand-picked Altium path survive updates. Keeping them outside AppData also avoids filesystem redirection by packaged Windows clients. Set the `ALTIUM_MCP_HOME` environment variable to use a different folder. A `config.json` left beside `server/main.py` by an older version is migrated automatically on first start.
 
-On a slow network the first build can exceed the client's 60-second startup timeout. The build carries on in the background, so restarting the extension once it has finished is enough; `build.log` shows progress.
+## Optional DXT Packaging (For Developers)
+
+The repository includes a `manifest.json` for clients that support `.dxt` desktop extensions. Packaging is optional; clients can launch the server directly as described above.
 
 **Build steps:**
 
 1. Make sure `start_server.py` exists at the repo root
 2. Make sure `server/main.py` does NOT have the old `site.addsitedir` hack at the top
-3. Update `manifest.json`: set `entry_point` to `start_server.py`, remove any `env`/`PYTHONPATH` fields, and use `manifest_version: "0.3"`
-4. Package the DXT — either use `dxt pack` or manually zip and rename:
+3. Keep `manifest.json` configured with `entry_point` set to `start_server.py`, no bundled-library `PYTHONPATH`, and `manifest_version: "0.3"`
+4. Package the DXT by zipping the files and renaming the archive:
 ```powershell
 Compress-Archive -Path manifest.json, start_server.py, pyproject.toml, requirements.txt, server -DestinationPath altium-mcp.zip
 Rename-Item altium-mcp.zip altium-mcp.dxt
@@ -85,35 +101,19 @@ Rename-Item altium-mcp.zip altium-mcp.dxt
 
 These are hard-won lessons from debugging DXT builds. Violating any of these will produce errors that are difficult to diagnose.
 
-1. **Do NOT use `os.execv()` in `start_server.py`.** The DXT installs to a path containing spaces (`Claude Extensions`). On Windows, `os.execv` splits the path at the space and fails. Use `sys.exit(subprocess.call([...]))` instead.
+1. **Do NOT use `os.execv()` in `start_server.py`.** Installation paths can contain spaces. On Windows, `os.execv` splits the path at the space and fails. Use `sys.exit(subprocess.call([...]))` instead.
 
 2. **Pin `mcp` to `==1.5.0`.** Using `>=1.5.0` pulls in the latest version, which has breaking API changes (`FastMCP.__init__()` dropped the `description` kwarg). The server code was written against 1.5.0.
 
-3. **Do NOT use `manifest_version: "0.4"` with `"type": "uv"`.** Claude Desktop does not support it yet. You will get `Invalid manifest: server: Required`. Use `"type": "python"` with `manifest_version: "0.3"`.
+3. **Keep the manifest aligned with the Python launcher.** The included manifest uses `"type": "python"` with `manifest_version: "0.3"`. Check the target client's supported manifest format before changing these fields.
 
 4. **After removing the `site.addsitedir` hack from `main.py`, fix the `pathlib.Path` reference.** The hack included `import pathlib` at the top of the file. The logging setup later uses `pathlib.Path(...)` which will throw `NameError` once that import is gone. Change it to `Path(...)` — the `from pathlib import Path` import already exists in the file, just make sure it comes before the logging setup.
 
 5. **Do NOT bundle `server/lib/` in the DXT.** That was the old approach and defeats the purpose of the venv bootstrap.
 
-### Legacy: Bundled server/lib (Not Recommended)
-
-This approach bundles all dependencies in `server/lib/` and sets `PYTHONPATH` to point to it. It produces a much larger .dxt (~17 MB) and **only works if the user's Python version matches the version used to compile the bundled packages**.
-
-1. Populate packages: `python -m pip install --no-cache-dir --target server/lib -r requirements.txt`
-2. Set the manifest `entry_point` to `server/main.py` and add `"env": {"PYTHONPATH": "${__dirname}/server/lib"}` to `mcp_config`
-3. Package: `npm install -g @anthropic-ai/dxt && dxt pack`
-
-### DXT Resources
-- [Desktop Extensions](https://www.anthropic.com/engineering/desktop-extensions)
-- [Desktop Extensions Github](https://github.com/anthropics/dxt)
-- [Getting Started with DXT](https://support.anthropic.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop)
-- [Python DXT Example Code](https://github.com/anthropics/dxt/tree/main/examples/file-manager-python)
-- [DXT Manifest](https://github.com/anthropics/dxt/blob/main/MANIFEST.md)
-
-
 ## Configuration
 
-When launching claude for the first time, the server will automatically try to locate your Altium Designer installation. It will search for all directories that start with `C:\Program Files\Altium\AD*` and use the one with the largest revision number. If it cannot find any, you will be prompted to select the Altium executable (X2.EXE) manually when you first run the server. Altium's DelphiScript scripting is used to create an API between the mcp server and Altium. 
+On first startup, the server will automatically try to locate your Altium Designer installation. It will search for all directories that start with `C:\Program Files\Altium\AD*` and use the one with the largest revision number. If it cannot find any, you will be prompted to select the Altium executable (X2.EXE) manually when you first run the server. Altium's DelphiScript scripting is used to create an API between the MCP server and Altium.
 
 ## Available Tools
 
@@ -144,7 +144,7 @@ The server provides several tools to interact with Altium Designer:
 - `get_symbol_primitives`: Inventory a .SchLib (every symbol with per-type primitive counts) or dump one symbol's complete geometry (all graphics + pin details, in mils; `symbol_name="*"` dumps every symbol). Used to gap-analyze a library, to give the agent a reference example when drawing a new symbol, and to verify recreations. The symbol creator round-trips a complete production library set exactly - 514/514 symbols across IC, connector, misc, and passives libraries (dump -> recreate -> dump -> diff, zero differences). Footprint/model links (implementations) are metadata outside the graphics round-trip.
 - `create_symbols_batch`: Create many symbols in one script run from a plain-text spec file (bulk imports/migrations) - far faster and more robust than one create call per symbol.
 - `build_schematic`: Build a wired schematic on a new sheet from a circuit description: parts from a `.SchLib` (full path; `.IntLib` is not supported), wires, junctions, net labels, power ports and notes, in mils. Returns every placed pin's true connection point, so a second call can route wires from measured coordinates, and lists any part it could not place. The new sheet is kept out of your project.
-- `get_symbol_placement_rules`: Create symbol's helper tool that reads `server\symbol_placement_rules.txt` in the extension's install folder to get pin placement rules for symbol creation.
+- `get_symbol_placement_rules`: Create symbol's helper tool that reads `server\symbol_placement_rules.txt` in the server's installation directory to get pin placement rules for symbol creation.
 - `get_library_symbol_reference`: Create symbol's helper tool to use an open library symbol as an example to create the symbol
 - `search_library_symbol`: Search for a symbol by name in a schematic library (.SchLib) and navigate to it. Supports partial name matching. Will open the library file in Altium if a path is provided, or show a file picker if not.
 
