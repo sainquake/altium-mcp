@@ -1108,7 +1108,9 @@ begin
     // An OutJob command that names its file needs no OutJob open in a
     // project: the command resolves and opens the named file itself.
     if (CommandName <> 'edit_schematic') and (CommandName <> 'get_schematic_connectivity') and
-       (CommandName <> 'set_library_component_data') and not (((CommandName = 'get_output_job_containers') or
+       (CommandName <> 'set_library_component_data') and
+       (CommandName <> 'create_document') and (CommandName <> 'save_document') and
+       (CommandName <> 'add_document_to_project') and not (((CommandName = 'get_output_job_containers') or
              (CommandName = 'run_output_jobs')) and
             (RequestOutJobPath(RequestData) <> '')) then
     begin
@@ -1168,6 +1170,8 @@ begin
             Result := ExecuteSchematicConnectivity(RequestData);
         'set_library_component_data':
             Result := ExecuteLibraryComponentData(RequestData);
+        'create_document', 'save_document', 'add_document_to_project':
+            Result := ExecuteManageDocument(CommandName, RequestData);
         'get_footprint_primitives':
             Result := ExecuteGetFootprintPrimitives(RequestData);
         'create_footprints_batch':

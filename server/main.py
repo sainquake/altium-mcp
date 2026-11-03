@@ -29,6 +29,7 @@ from outjob_parser import parse_outjob
 from schematic_editor import validate_request as validate_schematic_edit
 import schematic_connectivity
 import library_component_data
+import document_management
 from server_info import capture_runtime_info
 
 # Freeze source identity before serving requests, even if files are later updated.
@@ -1954,6 +1955,49 @@ async def set_library_component_data(ctx: Context, library_path: str, symbol_nam
     finally:
         if 'response' in locals() and response.get("success", False):
             spec_path.unlink(missing_ok=True)
+
+
+@mcp.tool()
+async def create_document(ctx: Context, document_path: str, document_kind: Optional[str] = None) -> str:
+    """Create a named unsaved document in Free Documents; never saves or adds it to a project.
+
+    Requires an absolute local path with an existing parent directory. Supports
+    .SchDoc (SCH), .PcbDoc (PCB), .SchLib (SCHLIB), .PcbLib (PCBLIB). Optional
+    document_kind must match the extension. Rejects existing files/open documents.
+    Use add_document_to_project separately. On failure inspect partial changes.
+    """
+    return await document_management.execute(altium_bridge, EXCHANGE_DIR, "create_document",
+                                             document_path, document_kind=document_kind)
+
+
+@mcp.tool()
+async def save_document(ctx: Context, document_path: str, dry_run: bool = False) -> str:
+    """Save ONLY the exact open SchDoc/PcbDoc/SchLib/PcbLib at its assigned local path.
+
+    Call only when the user authorizes saving that document. This writes a file;
+    it never invokes Save All, saves a project, renames or reloads a document.
+    Works for named unsaved documents created by create_document. dry_run=True
+    validates the open target without writing or clearing Modified; it does not
+    guarantee the editor will accept a later save. Rejects read-only/network paths.
+    Returns native save status, Modified state and disk SHA-256 readback. A timeout
+    may have written the file: inspect save_outcome_unknown before retrying.
+    """
+    return await document_management.execute(altium_bridge, EXCHANGE_DIR, "save_document",
+                                             document_path, dry_run=dry_run)
+
+
+@mcp.tool()
+async def add_document_to_project(ctx: Context, project_path: str, document_path: str) -> str:
+    """Add one exact document to an exact OPEN .PrjPcb or .LibPkg, in memory only.
+
+    Supports SchDoc/PcbDoc/SchLib/PcbLib; LibPkg supports libraries only. The source
+    must exist on disk or be an open named unsaved document. Idempotent when already
+    included. Does not depend on project focus, compile, save documents or save the
+    project. Project membership must later be saved explicitly in Altium to persist.
+    On API failure inspect may_have_partial_changes and membership before retrying.
+    """
+    return await document_management.execute(altium_bridge, EXCHANGE_DIR, "add_document_to_project",
+                                             document_path, project_path=project_path)
 
 
 @mcp.tool()

@@ -133,6 +133,10 @@ DItemRevisionGUID=
 GenerateClassCluster=0
 DocumentUniqueId=
 
+[Document10]
+DocumentPath=document_management.pas
+AnnotationEnabled=1
+
 [Document9]
 DocumentPath=library_component_data.pas
 AnnotationEnabled=1
