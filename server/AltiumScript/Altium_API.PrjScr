@@ -133,6 +133,10 @@ DItemRevisionGUID=
 GenerateClassCluster=0
 DocumentUniqueId=
 
+[Document9]
+DocumentPath=library_component_data.pas
+AnnotationEnabled=1
+
 [Document8]
 DocumentPath=schematic_connectivity.pas
 AnnotationEnabled=1

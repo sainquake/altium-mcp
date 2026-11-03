@@ -28,6 +28,7 @@ import sandbox
 from outjob_parser import parse_outjob
 from schematic_editor import validate_request as validate_schematic_edit
 import schematic_connectivity
+import library_component_data
 from server_info import capture_runtime_info
 
 # Freeze source identity before serving requests, even if files are later updated.
@@ -1904,6 +1905,55 @@ async def get_schematic_connectivity(ctx: Context, sheet_path: str, compiled: bo
         if expected_connections is not None:
             result["checks"] = schematic_connectivity.check_connections(result, expected_connections)
     return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+async def set_library_component_data(ctx: Context, library_path: str, symbol_name: str,
+                                     parameters: Optional[dict] = None, footprint_models: Optional[list] = None,
+                                     comment: Optional[str] = None, description: Optional[str] = None) -> str:
+    """Upsert parameters and PCB footprint models on an exact existing SchLib symbol.
+    Never saves documents or updates placed components. Omit edits to read metadata.
+    parameters maps names to string values; Comment/Designator are reserved (use
+    comment separately). Existing parameter visibility and unrelated data remain.
+    footprint_models: [{"model_name":"R_0603","library_path":"C:/Lib/Parts.PcbLib",
+    "pin_map":{"1":["2"],"2":["1"]},"is_current":true,"description":"optional"}].
+    Each model requires an existing PcbLib/footprint and a complete pin_map across
+    all symbol parts. One pin may map to several pads; pads cannot be reused by
+    different pins. Numbers are exact strings. Unsupported map delimiters fail.
+    Models are upserted by case-insensitive PCBLIB name; other models are kept.
+    Explicitly selecting a current footprint deselects other PCB models only.
+    Omitted is_current preserves existing state; new models default inactive.
+    All references are checked before edits. Locked/managed models and read-only
+    parameters are rejected. Returns before/after metadata and readback verification;
+    on API/readback failure inspect may_have_partial_changes before retrying.
+    """
+    try:
+        spec = library_component_data.prepare_request(library_path, symbol_name, parameters, footprint_models, comment, description)
+    except (ValueError, TypeError, OSError) as exc:
+        return json.dumps({"success": False, "error": str(exc), "saved": False, "may_have_partial_changes": False})
+    spec_path = EXCHANGE_DIR / f"library_data_{uuid.uuid4().hex}.txt"
+    try:
+        write_altium_text(spec_path, spec)
+        response = await altium_bridge.execute_command("set_library_component_data", {"spec_file": str(spec_path)})
+        if not response.get("success", False):
+            return json.dumps({"success": False, "error": response.get("error", "bridge failed"),
+                               "saved": False, "may_have_partial_changes": bool(parameters or footprint_models or comment is not None or description is not None),
+                               "spec_file": str(spec_path)})
+        result = response.get("result", {})
+        if isinstance(result, str):
+            result = json.loads(result)
+        for key in ("before", "after"):
+            if key in result:
+                library_component_data.enrich(result[key])
+        if result.get("success"):
+            errors = library_component_data.verify(result["after"], parameters, footprint_models, comment, description)
+            result["verification"] = {"passed": not errors, "errors": errors}
+            if errors:
+                result.update(success=False, error="library metadata readback mismatch", may_have_partial_changes=result["changed"])
+        return json.dumps(result, indent=2, ensure_ascii=False)
+    finally:
+        if 'response' in locals() and response.get("success", False):
+            spec_path.unlink(missing_ok=True)
 
 
 @mcp.tool()

@@ -1107,7 +1107,8 @@ begin
     // 'ERROR: ' prefix into success=false with this message.
     // An OutJob command that names its file needs no OutJob open in a
     // project: the command resolves and opens the named file itself.
-    if (CommandName <> 'edit_schematic') and (CommandName <> 'get_schematic_connectivity') and not (((CommandName = 'get_output_job_containers') or
+    if (CommandName <> 'edit_schematic') and (CommandName <> 'get_schematic_connectivity') and
+       (CommandName <> 'set_library_component_data') and not (((CommandName = 'get_output_job_containers') or
              (CommandName = 'run_output_jobs')) and
             (RequestOutJobPath(RequestData) <> '')) then
     begin
@@ -1165,6 +1166,8 @@ begin
             Result := ExecuteEditSchematic(RequestData);
         'get_schematic_connectivity':
             Result := ExecuteSchematicConnectivity(RequestData);
+        'set_library_component_data':
+            Result := ExecuteLibraryComponentData(RequestData);
         'get_footprint_primitives':
             Result := ExecuteGetFootprintPrimitives(RequestData);
         'create_footprints_batch':

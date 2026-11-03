@@ -1211,6 +1211,8 @@ begin
                                 AddJSONProperty(PrimProps, 'type', '');
                             eImplementationMap:
                                 AddJSONProperty(PrimProps, 'type', '');
+                            eMapDefiner:
+                                AddJSONProperty(PrimProps, 'type', '');
                             else
                             begin
                                 // Surface unknown graphic types instead of
