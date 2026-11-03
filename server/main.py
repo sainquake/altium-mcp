@@ -28,6 +28,11 @@ import sandbox
 from outjob_parser import parse_outjob
 from schematic_editor import validate_request as validate_schematic_edit
 import schematic_connectivity
+from server_info import capture_runtime_info
+
+# Freeze source identity before serving requests, even if files are later updated.
+SERVER_INFO = capture_runtime_info()
+SERVER_STARTED_MONOTONIC = time.monotonic()
 
 # Configure logging
 logging.basicConfig(
@@ -117,6 +122,8 @@ mcp = FastMCP(
     instructions=AGENT_INSTRUCTIONS,
     description="Altium integration through the Model Context Protocol",
 )
+# FastMCP 1.5 has no public version parameter; set the protocol server's version.
+mcp._mcp_server.version = SERVER_INFO["server_version"]
 
 class AltiumConfig:
     def __init__(self):
@@ -3219,9 +3226,15 @@ async def create_pcb_footprint(ctx: Context, footprint_name: str, description: s
 
 @mcp.tool()
 async def get_server_status(ctx: Context) -> str:
-    """Get the current status of the Altium MCP server"""
+    """Read live server identity, startup source fingerprint and configured paths.
+
+    Does not launch Altium or execute a script. altium_found and script_found
+    only check file existence; they do not verify Altium scripting health.
+    """
     status = {
         "server": "Running",
+        **SERVER_INFO,
+        "uptime_seconds": int(time.monotonic() - SERVER_STARTED_MONOTONIC),
         "altium_exe": altium_bridge.config.altium_exe_path,
         "script_path": altium_bridge.config.script_path,
         "altium_found": os.path.exists(altium_bridge.config.altium_exe_path),
@@ -3232,6 +3245,7 @@ async def get_server_status(ctx: Context) -> str:
 
 if __name__ == "__main__":
     logger.info("Starting Altium MCP Server...")
+    logger.info("Server identity: %s", json.dumps(SERVER_INFO))
     logger.info(f"Using MCP directory: {MCP_DIR}")
     
     # Initialize the directory

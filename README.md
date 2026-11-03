@@ -27,7 +27,41 @@ This Model Context Protocol (MCP) server exposes tools for inspecting and editin
 
 1. Install Python 3.10+ on Windows and make sure it is available to your MCP client.
 2. Clone or download this repository to a local directory.
-3. Configure your MCP client to launch `start_server.py` with Python using the stdio transport. Use an absolute path to the script. If Python is not on the client's PATH, use the full path to `python.exe` as the command.
+3. Register the server in your MCP client using the instructions below.
+
+### Codex
+
+With the [Codex CLI](https://developers.openai.com/codex/cli/) installed and available on PATH, run this from the repository directory:
+
+```powershell
+python .\start_server.py mcp setup --client codex
+```
+
+This runs the official `codex mcp add` command and registers `altium-mcp` with absolute paths to the current Python interpreter and `start_server.py`. It uses Codex's user configuration (`%USERPROFILE%\.codex\config.toml` by default, or the directory set by `CODEX_HOME`), shared by the desktop app, CLI and IDE extension on the same host. Re-running setup replaces the `altium-mcp` entry; other servers are preserved. If `ALTIUM_MCP_HOME` is set, setup includes its absolute path in the server environment.
+
+Setup only registers the server. Prepare dependencies before the first connection to avoid Codex's startup timeout:
+
+```powershell
+python .\start_server.py --build
+codex mcp get altium-mcp
+```
+
+Restart Codex or reload its MCP servers, then call `get_server_status` to check the connection. Keep the repository at the registered path; run setup again after moving it or changing Python.
+
+If you use the desktop app without the Codex CLI, add this table to your Codex `config.toml` instead, replacing both paths with your actual locations:
+
+```toml
+[mcp_servers.altium-mcp]
+command = "C:/path/to/python.exe"
+args = ["C:/path/to/altium-mcp/start_server.py"]
+startup_timeout_sec = 60
+```
+
+If the table already exists, update it instead of adding a duplicate. See the [official Codex MCP documentation](https://developers.openai.com/codex/mcp/) for configuration details.
+
+### Other MCP clients
+
+Configure your MCP client to launch `start_server.py` with Python using the stdio transport. Use an absolute path to the script. If Python is not on the client's PATH, use the full path to `python.exe` as the command.
 
 For clients that use an `mcpServers` configuration, a typical entry looks like this. Other clients may use a different configuration format; the launch command and arguments are the same.
 
@@ -53,6 +87,104 @@ python start_server.py --build
 Use the same Python interpreter and `ALTIUM_MCP_HOME` setting as the client. If a first launch exceeds the client's startup timeout, the detached build continues in the background; reconnect after it finishes. Build progress is recorded in `%USERPROFILE%\.altium-mcp\build.log` (or the directory set by `ALTIUM_MCP_HOME`).
 
 Clients that support `.dxt` desktop extensions can alternatively install `altium-mcp.dxt` from [releases](https://github.com/coffeenmusic/altium-mcp/releases) using their extension installer.
+
+## Manual Server Verification
+
+This is a local stdio server: the MCP client starts a Python process and communicates over its stdin/stdout. It has no HTTP health URL or listening port. A successful tool response checks the connection; a saved registration or an existing Python process alone does not.
+
+### 1. Check the registered command
+
+For Codex, run:
+
+```powershell
+codex mcp list
+codex mcp get altium-mcp
+```
+
+Check that the server is enabled and that `command` and `args` point to the intended Python interpreter and repository. These commands inspect configuration; they do not start the server or prove it is responding. Without the Codex CLI, inspect the entry in the desktop app's MCP settings or `config.toml`.
+
+### 2. Check the instance connected to your client
+
+Open Codex with the server enabled and ask:
+
+```text
+Call the altium-mcp get_server_status tool now and show its complete JSON response.
+```
+
+The call takes no arguments and does not launch Altium or execute a script. Check these fields in the actual tool response:
+
+| Field | Meaning |
+| --- | --- |
+| `server` | `Running` means this process answered an MCP tool call. |
+| `server_version` | Altium MCP project version from `pyproject.toml`, captured at startup. |
+| `source_sha256` | Source fingerprint captured at startup; distinguishes local changes with the same project version. |
+| `installation_path`, `server_path` | Installation and entry point used by this process. |
+| `pid` | PID of the Python process answering the call. |
+| `started_at`, `uptime_seconds` | Startup time in UTC and elapsed running time. |
+| `python_executable`, `python_version` | Interpreter running the server, normally inside its dependency venv. |
+| `mcp_sdk_version` | Installed MCP Python SDK version; this is separate from `server_version`. |
+| `altium_found`, `script_found` | Whether the configured Altium executable and script project exist. |
+
+`altium_found: true` does not mean Altium is open or scripting works. To check the Altium bridge too, open a project in Altium, focus it, then call `get_project_info` and confirm it returns that project's details. This reads project information without saving it.
+
+If version or PID fields are absent, the client may still be running an older server. Restart or reload its MCP server and repeat the call.
+
+### 3. Compare the running instance with files on disk
+
+From the repository you expect to be running:
+
+```powershell
+python .\start_server.py --version
+```
+
+This prints JSON with `server_version`, `source_sha256`, `installation_path` and `server_path` without starting a server or installing dependencies. Compare it with the live `get_server_status` response. Matching paths and fingerprints mean the process's startup snapshot matches this installation's current runtime files. A different fingerprint means the files changed after startup or the client is using another copy; restart the client's server and check again.
+
+The fingerprint covers the launcher, top-level server Python modules, bundled DelphiScript sources/projects, symbol placement rules, and dependency/version metadata. Documentation, tests, logs and user configuration are excluded. The project version alone can stay the same across local edits. `unknown` for the version or `null` for the fingerprint means the corresponding metadata could not be read.
+
+Updating files does not reload an already running Python server. After restarting, `started_at` should change and `uptime_seconds` should reset; the PID will usually change too. Compare fingerprints again to confirm the update.
+
+### 4. Inspect Windows processes and logs
+
+To find the launcher and server processes:
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name = 'python.exe' OR Name = 'pythonw.exe'" |
+    Where-Object { $_.CommandLine -match 'start_server\.py|[\\/]server[\\/]main\.py' } |
+    Select-Object ProcessId, ParentProcessId, ExecutablePath, CommandLine
+```
+
+Match `ProcessId` to the `pid` returned by `get_server_status` and inspect its absolute paths. The launcher and server can appear as separate processes. Multiple clients can each run their own instance, so check status through the client you are diagnosing.
+
+From the installation directory, inspect recent server messages:
+
+```powershell
+Get-Content .\server\altium_mcp.log -Tail 60
+```
+
+The startup `Server identity` log entry includes the version, fingerprint, PID and timestamp. Log entries can belong to previous or other client sessions; use the live status call to identify the responding process.
+
+If startup fails while dependencies are being prepared, inspect the build log:
+
+```powershell
+$altiumMcpData = if ($env:ALTIUM_MCP_HOME) { $env:ALTIUM_MCP_HOME } else { Join-Path $env:USERPROFILE '.altium-mcp' }
+Get-Content (Join-Path $altiumMcpData 'build.log') -Tail 60
+```
+
+### 5. Test independently with MCP Inspector
+
+For a manual protocol test without an AI client, use the [official MCP Inspector](https://github.com/modelcontextprotocol/inspector/blob/main/docs/cli-smoke-testing.md). Its current CLI requires Node.js 22.19.0 or newer and npm/npx. From the repository directory, use the same Python interpreter and `ALTIUM_MCP_HOME` setting as your client:
+
+```powershell
+python .\start_server.py --build
+npx @modelcontextprotocol/inspector --cli python .\start_server.py --method initialize --connect-timeout 60000
+npx @modelcontextprotocol/inspector --cli python .\start_server.py --method tools/call --tool-name get_server_status --connect-timeout 60000
+```
+
+The first Inspector command should complete the MCP handshake and report `serverInfo.name: AltiumMCP` and the project version in `serverInfo.version`. The second should return a text content block containing the status JSON described above. The initial npx run can download Inspector. If the configured Python is not on PATH, replace `python` with its quoted absolute path.
+
+Each Inspector command starts and stops its own server instance. It tests the selected installation independently; use step 2 to inspect the instance already connected to Codex. To use Inspector's browser UI instead, run `npx @modelcontextprotocol/inspector python .\start_server.py`, connect to the stdio server, list its tools, and call `get_server_status` with empty arguments (`{}`).
+
+Running `python .\start_server.py` by itself leaves it waiting for MCP messages on stdin. A quiet terminal is expected and does not verify the protocol; use Inspector or an MCP client, and use Ctrl+C to stop a manual launch.
 
 ## Launcher and Dependency Environment
 
@@ -187,7 +319,7 @@ The cool thing about layout duplication this way as opposed to with Altium's bui
 - `ensure_altium_script_skill`: Check whether the [altium-script skill](https://github.com/coffeenmusic/altium-scripts-skill) (Altium DelphiScript API reference, examples, and conventions) is installed, and install it on request. Skills load at client startup, so a newly installed skill appears after a restart.
 
 ### Server Status
-- `get_server_status`: Check the status of the MCP server, including paths to Altium and script files
+- `get_server_status`: Read the responding process's project/SDK versions, startup source fingerprint, PID, start time, uptime, interpreter and configured Altium/script paths. See [manual server verification](#manual-server-verification).
 
 ## How It Works
 
