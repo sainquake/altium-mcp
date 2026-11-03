@@ -68,7 +68,7 @@ async def run(args):
             report["test_marker"] = marker
             definitions = [
                 ("component", {"source_designator": source["designator"], "designator": marker,
-                               "x": x, "y": y, "comment": "test | = , quote \" ' Тест",
+                               "x": x, "y": y, "comment": "test | = , quote \" ' \u0422\u0435\u0441\u0442",
                                "parameters": {"MCP_TEST": "initial"}}),
                 ("wire", {"points": [x, y + 1000, x + 500, y + 1000]}),
                 ("net_label", {"x": x, "y": y + 1000, "text": marker}),
@@ -92,13 +92,13 @@ async def run(args):
             assert len(objects[added_ids[0][1]]["pins"]) == len(source["pins"])
             updates = [
                 {"x": x + 100, "y": y + 100, "orientation": 1, "mirror": True,
-                 "comment": "updated, | = \" ' Проверено", "parameters": {"MCP_TEST": "updated"}},
+                 "comment": "updated, | = \" ' \u041f\u0440\u043e\u0432\u0435\u0440\u0435\u043d\u043e", "parameters": {"MCP_TEST": "updated"}},
                 {"points": [x, y + 1100, x + 250, y + 1100, x + 500, y + 1200]},
                 {"x": x + 100, "y": y + 1100, "text": marker + "_updated", "orientation": 1},
                 {"x": x + 500, "y": y + 1200, "name": "MCP_TST2", "width": 1000, "io_type": 3, "style": 3},
                 {"x": x + 100, "y": y + 1600, "text": marker + "_updated", "style": 5, "orientation": 3, "show_net_name": False},
                 {"x": x + 250, "y": y + 1100},
-                {"x": x, "y": y + 2100, "text": marker + "\nПроверено", "orientation": 2},
+                {"x": x, "y": y + 2100, "text": marker + "\n\u041f\u0440\u043e\u0432\u0435\u0440\u0435\u043d\u043e", "orientation": 2},
             ]
             result = require(await call([{"op": "update", "type": kind, "target": {"unique_id": uid}, "properties": props}
                                          for (kind, uid), props in zip(added_ids, updates)], "update"))

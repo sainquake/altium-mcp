@@ -1,14 +1,13 @@
 # edit_schematic(sheet_path, operations)
 
-Редактирование конкретного существующего листа Altium в памяти. Функция
-добавляет, изменяет и удаляет объекты, не вызывает сохранение и не сбрасывает
-признак Modified. После правок лист может оставаться помеченным `*`, даже если
-тестовые объекты впоследствии удалены.
+Adds, updates and deletes objects on an existing Altium schematic in memory.
+Never saves documents or clears Modified. A sheet may retain its `*` marker
+after test objects have been removed.
 
-`build_schematic` создаёт новый лист. Для продолжения работы на существующем
-листе используйте `edit_schematic` с его полным путём.
+`build_schematic` creates a new sheet. Use `edit_schematic` with an exact path
+to continue working on an existing sheet.
 
-## Чтение и адресация
+## Reading and targeting
 
 ```python
 edit_schematic(
@@ -17,25 +16,23 @@ edit_schematic(
 )
 ```
 
-Путь должен быть абсолютным и указывать на существующий `.SchDoc`.
-Закрытый лист открывается без перезагрузки уже открытой копии; несохранённые
-изменения учитываются. Фокус другого листа или библиотеки не меняет цель.
-Библиотеки и файлы с другим расширением как цель запрещены.
+The path must be absolute and identify an existing `.SchDoc`. A closed sheet
+is opened; an already open sheet is reused with its unsaved changes. Focus on
+another sheet/library does not change the target. Libraries and other file
+types are rejected.
 
-`objects` содержит поддерживаемые объекты верхнего уровня: `type`, `unique_id`,
-`x`, `y` и свойства соответствующего типа. Для компонентов возвращаются
-`designator`, `symbol`, `comment`, `description`, `orientation`, `mirror`,
-`parameters` и `pins`. В `pins` находятся обозначения, имена и **электрические
-точки подключения** в абсолютных координатах, а не координаты у тела символа.
-Для провода возвращается полный массив `points`.
+`objects` contains supported top-level objects with `type`, `unique_id`, `x`,
+`y` and type-specific properties. Components include `designator`, `symbol`,
+`comment`, `description`, `orientation`, `mirror`, `parameters` and `pins`.
+Pin records contain numbers, names and absolute **electrical connection
+points**, not their body-end coordinates. Wires include their full `points` array.
 
-Для изменения и удаления используйте `target={"unique_id": "..."}` из свежего
-ответа этого же листа. Для компонента также разрешено
-`target={"designator": "R1"}`. Селектор должен содержать ровно один ключ и
-совпасть ровно с одним объектом указанного типа. При неоднозначности, в том числе
-для нескольких частей с одинаковым обозначением, используйте UID экземпляра.
+Use `target={"unique_id": "..."}` from a fresh response for that sheet.
+Components also accept `target={"designator": "R1"}`. A selector must have
+exactly one key and match exactly one object of the specified type. For
+ambiguous designators, including multipart components, use the instance UID.
 
-## Формат операций
+## Operations
 
 ```python
 {"op": "add", "type": "wire", "properties": {"points": [1000, 1000, 1500, 1000]}}
@@ -44,130 +41,118 @@ edit_schematic(
 {"op": "delete", "type": "net_label", "target": {"unique_id": "ABCDEFGH"}}
 ```
 
-- `op`: `add`, `update` или `delete`.
-- `type`: один из типов в таблице ниже, обязателен для каждой операции.
-- `target`: только для `update`/`delete`.
-- `properties`: обязательные свойства для `add`, непустой набор для `update`;
-  для `delete` отсутствует или пустой.
-- Координаты и размеры задаются в **mils**, допускаются дробные числа в пределах
-  ±200000 mil. `x` и `y` всегда передаются вместе.
-- Ориентация: целое 0–3, соответствует значениям API Altium, не градусам.
-- Неизвестные ключи, NaN, бесконечности, неверные типы и NUL в строках запрещены.
-- До 500 операций в одном вызове. Один существующий объект разрешено изменять
-  только один раз за пакет, даже если селекторы различаются.
+- `op`: `add`, `update` or `delete`.
+- `type`: required for every operation; see the table.
+- `target`: required only for `update`/`delete`; omit for `add`.
+- `properties`: required fields for `add`, a nonempty subset for `update`,
+  omitted or empty for `delete`.
+- Coordinates and sizes are **mils**, including fractions within +/-200000 mil.
+  Supply `x` and `y` together.
+- Orientation is an Altium API integer 0-3, not degrees.
+- Unknown keys, NaN, infinity, invalid types and NUL characters are rejected.
+- At most 500 operations per call, with one edit per existing target per batch,
+  even when different selectors identify it.
 
-| type | properties | Обязательно при add |
+| type | properties | Required for add |
 | --- | --- | --- |
-| `component` | `x`, `y`, `designator`, `comment`, `description`, `orientation`, `mirror` (bool), `parameters` (словарь строк) | `x`, `y`, `designator` и источник символа |
-| `wire` | `points`: плоский массив `[x1,y1,x2,y2,...]`, 2–1000 точек | `points` |
+| `component` | `x`, `y`, `designator`, `comment`, `description`, `orientation`, `mirror` (bool), `parameters` (string dictionary) | `x`, `y`, `designator`, symbol source |
+| `wire` | `points`: flat `[x1,y1,x2,y2,...]` array, 2-1000 points | `points` |
 | `net_label` | `x`, `y`, `text`, `orientation` | `x`, `y`, `text` |
-| `port` | `x`, `y`, `name`, `io_type` (0–3), `style` (0–7), `width` > 0 | `x`, `y`, `name` |
-| `power_port` | `x`, `y`, `text`, `orientation`, `style` (0–10), `show_net_name` (bool) | `x`, `y`, `text` |
+| `port` | `x`, `y`, `name`, `io_type` (0-3), `style` (0-7), `width` > 0 | `x`, `y`, `name` |
+| `power_port` | `x`, `y`, `text`, `orientation`, `style` (0-10), `show_net_name` (bool) | `x`, `y`, `text` |
 | `junction` | `x`, `y` | `x`, `y` |
 | `text` | `x`, `y`, `text`, `orientation` | `x`, `y`, `text` |
 
-Для `update` меняются только переданные свойства. `wire.points` заменяет все
-вершины, включая уменьшение их числа. Параметры компонента добавляются или
-обновляются без учёта регистра имени; остальные сохраняются. Для Comment и
-Designator используйте отдельные свойства. Удаление параметров и замена символа
-компонента этим инструментом не поддержаны.
+Updates change only supplied properties. `wire.points` replaces every vertex,
+including when shortening the list. Component parameters are added/updated
+case-insensitively; other parameters remain. Use dedicated `comment` and
+`designator` properties for those fields. Parameter deletion and symbol
+replacement are not supported.
 
-Для добавления компонента выберите **один** источник:
+Choose exactly one component source:
 
 ```python
-# Копия существующего экземпляра с новым UID и обозначением.
+# Clone a placed instance with a new UID and designator.
 {"op": "add", "type": "component", "properties": {
     "source_designator": "R1", "designator": "R200",
     "x": 8000, "y": 4000, "comment": "47k", "orientation": 0
 }}
 
-# Символ из существующей SchLib (IntLib не поддержана).
+# Place from an existing SchLib; IntLib is unsupported.
 {"op": "add", "type": "component", "properties": {
     "symbol_library": r"C:\Libraries\Passives.SchLib", "symbol": "Resistor",
     "designator": "R201", "x": 8500, "y": 4000
 }}
 ```
 
-`source_designator`, `symbol_library` и `symbol` разрешены только при `add`.
-Источники разрешаются до начала редактирования; компоненты, добавляемые текущим
-пакетом, становятся доступными источниками в следующем вызове. Существующие
-обозначения и обозначения, уже зарезервированные этим пакетом, запрещены для
-добавления/переименования. Добавление другой части с тем же обозначением и обмен
-обозначениями в одном пакете не поддержаны.
+`source_designator`, `symbol_library` and `symbol` are add-only. Sources are
+resolved before editing; components added in a batch become available as sources
+in the next call. Existing or already reserved designators cannot be reused for
+addition/renaming. Adding another part with the same designator and swapping
+designators in one batch are unsupported.
 
-Компонент получает новые UID; геометрия, выводы и метаданные берутся из источника.
-Без указания ориентации и отражения сохраняется поза источника. Библиотека
-используется только для чтения. Редактируется сохранённая в переменной целевая
-схема, даже если открытие SchLib переключило активный редактор.
+New components receive fresh UIDs and source geometry, pins and metadata.
+Source orientation/mirroring is retained unless specified. Libraries are read
+only; the held target sheet remains the edit destination even if opening a
+SchLib changes the active editor.
 
-## Результат и ошибки
+## Results and failures
 
-Успешный ответ содержит `success=true`, `sheet_path`, `saved=false`,
-`was_modified`, `applied_count`, `results` и `objects`.
-В `results` для каждой операции находятся `index` (с нуля), `op`, `type` и
-`unique_id`; при удалении возвращается UID удалённого объекта.
+A successful response contains `success=true`, `sheet_path`, `saved=false`,
+`was_modified`, `applied_count`, `results` and `objects`. Each operation result
+contains zero-based `index`, `op`, `type` and `unique_id`. Deletion returns the
+removed object's UID.
 
-Форма и типы аргументов проверяются Python до запуска Altium. Затем DelphiScript
-проверяет все селекторы, источники и конфликты обозначений до первой правки.
-Ошибка этой проверки возвращает `applied_count=0`, `failed_index` и
-`may_have_partial_changes=false`. Активная незавершённая транзакция редактора
-блокирует изменение листа.
+Python validates argument shape/types before dispatch. DelphiScript resolves
+all targets, symbol sources and designator conflicts before the first edit.
+Preflight failures return `applied_count=0`, `failed_index` and
+`may_have_partial_changes=false`. An unfinished editor transaction blocks edits.
 
-Редактирование выполняется в `PreProcess`/`PostProcess`, изменения уведомляют
-undo-систему. При исключении API ответ содержит число завершённых операций,
-`failed_index` и `may_have_partial_changes=true`. Это не гарантия атомарного
-отката: текущая операция также могла частично примениться. При тайм-ауте моста
-возвращается ошибка с неопределённым состоянием и путём spec-файла. Не повторяйте
-такой пакет вслепую; восстановите исполнитель, прочитайте лист и выясните,
-какие UID существуют. Входной spec сохраняется для диагностики до успешного
-ответа моста. Обычные успешные вызовы удаляют свой уникальный spec-файл.
+Edits use `PreProcess`/`PostProcess` and undo notifications. API failures report
+completed operations, `failed_index` and `may_have_partial_changes=true`.
+There is no atomic rollback guarantee: the failing operation may also have
+partially applied. Bridge timeouts report uncertain state and the input spec
+path. Do not blindly retry; recover the executor, read the sheet and inspect
+which UIDs exist. Uncertain requests retain their spec for diagnosis/late
+execution; completed bridge responses remove the unique input spec.
 
-## Электрические и графические особенности
+## Electrical and display behavior
 
-Перемещение компонента не переразводит его провода. Сначала прочитайте `pins`,
-затем обновите провода от измеренных точек. Метка должна касаться своего
-провода; точки соединения и порты добавляются явно. Полный ERC/компиляция проекта
-не выполняется автоматически. См. [правила построения схем](SCHEMATIC_CONVENTIONS.md).
+Moving a component does not reroute wires. Read measured `pins` first, then
+route from their electrical connection points. Labels must touch their wires;
+junctions and ports are explicit. Full ERC/project compilation is not automatic.
+See [schematic conventions](SCHEMATIC_CONVENTIONS.md).
 
-`port.io_type`: 0 — unspecified, 1 — output, 2 — input, 3 — bidirectional.
-Стиль порта и power port выбирайте по существующим объектам, а не по внешнему
-сходству. Altium может увеличить ширину порта при перерисовке, если его имя не
-помещается; учитывайте это при следующем чтении. `show_net_name=false` у power
-port не гарантирует, что Altium скроет текст GND.
+`port.io_type`: 0 unspecified, 1 output, 2 input, 3 bidirectional. Derive port
+and power-port styles from existing objects. Altium may expand a port's width
+on redraw if its name does not fit. `show_net_name=false` does not guarantee
+that Altium hides a GND label.
 
-Регистрация/удаление реализованы по
-[официальному описанию Schematic API](https://www.altium.com/documentation/altium-dxp-developer/schematic-api-design-objects-interfaces-reference).
-Удаление использует `RemoveSchObject` и `SCHM_PrimitiveRegistration`, сохраняя
-объект для undo. `UnRegisterSchObjectFromContainer` немедленно освобождает объект
-и для этого сценария не используется; см.
-[ISch_Document](https://www.altium.com/documentation/altium-dxp-developer/isch-document-interface).
+Deletion uses `RemoveSchObject` followed by `SCHM_PrimitiveRegistration` to
+retain the object for undo. `UnRegisterSchObjectFromContainer` frees it
+immediately and is not used. See the official
+[Schematic API](https://www.altium.com/documentation/altium-dxp-developer/schematic-api-design-objects-interfaces-reference)
+and [ISch_Document](https://www.altium.com/documentation/altium-dxp-developer/isch-document-interface).
 
-## Тестирование
-
-Модульные проверки без Altium:
+## Verification
 
 ```powershell
 python -m unittest server.tests.test_schematic_editor server.tests.test_sandbox server.tests.test_altium_files server.tests.test_outjob_parser -v
-```
-
-Живой тест требует запущенный Altium, открытый проект и существующий лист.
-Без `--exercise` скрипт только читает:
-
-```powershell
 python dev/test_edit_schematic_live.py --sheet 'C:\Projects\Board\Display.SchDoc'
 python dev/test_edit_schematic_live.py --sheet 'C:\Projects\Board\Display.SchDoc' --exercise --library 'C:\Projects\Board\Symbols.SchLib'
 ```
 
-Используйте Python окружения MCP с установленными зависимостями. `--exercise`
-создаёт временные объекты вдали от схемы, изменяет их, проверяет отказ всего
-пакета при неверной цели, затем удаляет тестовые объекты по возвращённым UID.
-Исходные объекты не редактируются. Проверяется совпадение снимков поддерживаемых
-объектов до/после и SHA-256 всех `.SchDoc` проекта. Снимки, spec-копии скриптов и
-отчёт остаются в `.altium-mcp/schematic_edit_<timestamp>` репозитория инструмента.
-Свежая копия PrjScr исключает выполнение кешированного кода при разработке.
-Настройки пользователя и файлы проекта не переписываются.
+Use the MCP Python environment with dependencies installed and the target
+project open in Altium. Without `--exercise`, the runner only reads.
+`--exercise` adds temporary objects away from the circuit, updates them, checks
+batch rejection for an invalid target, then removes test objects by returned
+UIDs. Original objects are not edited. Before/after object snapshots and SHA-256
+hashes of all project `.SchDoc` files are compared.
 
-После обновления кода перезапустите MCP-сервер/обновите подключение клиента,
-чтобы `edit_schematic` появился в каталоге. Если Altium держит старую копию
-скриптов открытой в редакторе, закройте и снова откройте именно проект скриптов
-`Altium_API.PrjScr`, не сохраняя устаревший буфер поверх обновлённых файлов.
+Snapshots, script copies and reports stay under the toolkit's
+`.altium-mcp/schematic_edit_<timestamp>` directory. A fresh PrjScr copy avoids
+cached code during development. User settings and project files are not rewritten.
+
+Restart the MCP connection to refresh its tool catalog. If Altium retains old
+script buffers, reopen `Altium_API.PrjScr` without saving stale buffers over
+updated files. See the [live test report](EDIT_SCHEMATIC_LIVE_TEST.md).

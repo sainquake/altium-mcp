@@ -27,6 +27,7 @@ from altium_files import read_altium_text, write_altium_text
 import sandbox
 from outjob_parser import parse_outjob
 from schematic_editor import validate_request as validate_schematic_edit
+import schematic_connectivity
 
 # Configure logging
 logging.basicConfig(
@@ -1854,6 +1855,48 @@ async def edit_schematic(ctx: Context, sheet_path: str, operations: list) -> str
         # Keep a timed-out request's spec: a late-starting script still needs it.
         if 'response' in locals() and response.get("success", False):
             spec_path.unlink(missing_ok=True)
+
+
+@mcp.tool()
+async def get_schematic_connectivity(ctx: Context, sheet_path: str, compiled: bool = True,
+                                     expected_connections: Optional[list] = None) -> str:
+    """Read pin numbers, electrical-end coordinates (mils) and actual compiler nets
+    for one exact .SchDoc in exactly one open PCB project. Never saves sheets.
+
+    compiled=True recompiles the owning project in memory. False reads the last
+    compiler cache, explicitly marked may_be_stale; fails if there is no model.
+    Reads actual flattened nets from Altium, including cross-sheet connections.
+    Pins missing from the compiler model remain in the result with null net and
+    resolution=not_in_compiled_model. Inspect complete, warnings and compiler
+    error counts. No electrical connectivity is inferred from drawing geometry.
+
+    Optional expected_connections: [{"pins":[{"designator":"C2","pin_number":"1"},
+    {"designator":"TP1","pin_number":"1"}],"net_name":"GND","exact":False}].
+    Each group must share one net; net_name optionally also checks its name.
+    exact=True rejects additional pins ON THIS SHEET, ignoring remote sheets.
+    connected=False instead checks that exactly two pins are on different nets;
+    omit net_name/exact for that case. A single-pin check requires net_name or
+    exact=True. Pin selectors may also include component_uid, part_id and/or
+    instance_id from the response to disambiguate repeated channels/parts.
+    Unknown, ambiguous or unresolved pins fail checks. Returns pins, nets with
+    local members/project pin counts, coverage and optional checks with issues.
+    success describes retrieval; checks.passed describes expected connections.
+    """
+    try:
+        path = schematic_connectivity.validate_request(sheet_path, compiled, expected_connections)
+    except (ValueError, TypeError, OSError) as exc:
+        return json.dumps({"success": False, "error": str(exc), "saved": False}, ensure_ascii=False)
+    response = await altium_bridge.execute_command("get_schematic_connectivity", {"sheet_path": path, "compiled": compiled})
+    if not response.get("success", False):
+        return json.dumps({"success": False, "error": response.get("error", "bridge failed"), "saved": False})
+    result = response.get("result", {})
+    if isinstance(result, str):
+        result = json.loads(result)
+    if result.get("success", False):
+        result = schematic_connectivity.reconcile(result)
+        if expected_connections is not None:
+            result["checks"] = schematic_connectivity.check_connections(result, expected_connections)
+    return json.dumps(result, indent=2, ensure_ascii=False)
 
 
 @mcp.tool()

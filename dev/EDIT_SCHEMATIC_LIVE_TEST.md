@@ -1,69 +1,65 @@
-# Проверка edit_schematic в Altium
+# edit_schematic live verification
 
-Дата: 03.11.2026. Altium Designer Enterprise 24.4.1.
-Открытый проект: `SALT-FMUV6X-JETSON`, целевой лист: `Display.SchDoc`.
-Тест выполнялся без сохранения документов.
+Date: 2026-11-03. Altium Designer Enterprise 24.4.1.
+Open project: `SALT-FMUV6X-JETSON`; target: `Display.SchDoc`.
+No documents were saved.
 
-## Результат
+## Results
 
-| Проверка | Результат |
+| Check | Result |
 | --- | --- |
-| Регистрация MCP | `edit_schematic` зарегистрирован, обязательные аргументы `sheet_path`, `operations` |
-| Чтение `operations=[]` | 382 поддерживаемых объекта, UID, параметры и электрические точки выводов |
-| Добавление | 7 типов: component, wire, net_label, port, power_port, junction, text |
-| Изменение по UID | Все 7 типов: координаты, ориентация, отражение, параметры/Comment, точки провода и свойства портов |
-| Изменение по designator | Переименование и изменение Comment тестового компонента |
-| Компонент из SchLib | Добавлен реальный символ из проектной `fmuv5X.SchLib` |
-| Неверная цель во второй операции | Весь пакет отклонён, первая правка не применена |
-| Нечётный массив точек провода | Отклонён до обращения к Altium |
-| Дубликат обозначения | Отклонён без правок |
-| Одна цель через разные селекторы | Отклонена до редактирования |
-| Отсутствующий символ SchLib | Отклонён без правок |
-| Unicode/экранирование | Кириллица, кавычки, апостроф, `|`, `=`, запятые и перенос строки прочитаны обратно без потерь |
-| Удаление | Удалены все 8 тестовых объектов: 7 первоначальных и компонент из библиотеки |
-| Состояние в памяти | Снимки 382 исходных поддерживаемых объектов до/после полностью совпали |
-| Сохранённые файлы | SHA-256 всех 12 `.SchDoc` проекта до/после совпали |
-| Исполнитель | Финальный диагностический скрипт выполнился, `ProcessDepth=0` |
+| MCP registration | `edit_schematic` registered with required `sheet_path`, `operations` |
+| Read with `operations=[]` | 382 supported objects, UIDs, parameters and electrical pin coordinates |
+| Add | All 7 types: component, wire, net_label, port, power_port, junction, text |
+| Update by UID | All 7 types: position, orientation, mirroring, parameters/Comment, wire vertices and port properties |
+| Update by designator | Test component renamed and Comment changed |
+| SchLib placement | Real symbol placed from project `fmuv5X.SchLib` |
+| Invalid second target | Entire batch rejected; first edit not applied |
+| Odd wire coordinate count | Rejected before Altium dispatch |
+| Duplicate designator | Rejected without edits |
+| Same target through different selectors | Rejected before editing |
+| Missing SchLib symbol | Rejected without edits |
+| Unicode/escaping | Non-ASCII text, quotes, apostrophes, pipes, equals signs, commas and newlines round-tripped |
+| Delete | All 8 test objects removed: 7 initial objects and the library component |
+| In-memory restoration | Before/after snapshots of 382 original supported objects matched |
+| Disk verification | SHA-256 hashes of all 12 project `.SchDoc` files matched |
+| Executor | Final probe succeeded with `ProcessDepth=0` |
 
-При проверке геометрии скопирован двухвыводный `C1`. Его выводы после переноса
-сохранили смещения −100/+200 mil относительно компонента; после поворота и
-отражения получены измеренные точки `(16350,1000)` и `(16350,1300)` для начала
-компонента `(16350,1100)`. Проверялось не только изменение флагов позы, но и
-фактическое перемещение электрических точек.
+Geometry was checked using a copy of two-pin `C1`. After translation its pins
+retained offsets of -100/+200 mil from the component origin. Rotation and
+mirroring produced measured connection points `(16350,1000)` and `(16350,1300)`
+for origin `(16350,1100)`, verifying physical pin movement as well as pose flags.
 
-Модульный регрессионный набор: **41 тест, 40 успешных, 1 пропущен**. Пропуск —
-существующая проверка кодовой страницы CP1252, отсутствующей в текущей системе.
+Regression run: **41 tests, 40 passed, 1 skipped**. The existing CP1252 test
+was skipped because that code page is not used by the current system.
 
-Команда воспроизведения приведена в [описании инструмента](EDIT_SCHEMATIC.md).
-Полные локальные снимки и машинный отчёт:
+Reproduction commands are in the [API documentation](EDIT_SCHEMATIC.md).
+Local snapshots and machine report:
 `.altium-mcp/schematic_edit_20261103_000855/report.json`.
-Эти артефакты исключены из Git и находятся в репозитории инструмента, вне PCB-проекта.
+Artifacts are Git-ignored and stored in the toolkit checkout, outside the PCB
+project.
 
-## Исправления по результатам разработки
+## Fixes found during development
 
-Первичная проверка обнаружила недоступную константу типа целевого документа.
-Использована проверенная величина `ObjectId=32` для SchDoc и `33` для SchLib.
-Чтение повторно проверено на открытом листе.
+Initial reading exposed an unavailable document-kind constant. Verified numeric
+IDs, `32` for SchDoc and `33` for SchLib, replaced it and reading was retested.
 
-Первый тест удаления выявил неподдерживаемое уведомление API. Удаление заменено
-на `RemoveSchObject` с `SCHM_PrimitiveRegistration`. Все семь оставшихся
-тестовых объектов удалены по UID, исходный снимок восстановлен. Незавершённая
-транзакция этого прерванного теста завершена; перед финальным прогоном и после
-него подтверждено отсутствие активных транзакций.
+The first deletion test exposed an unsupported API notification. Deletion was
+changed to `RemoveSchObject` with `SCHM_PrimitiveRegistration`. All seven
+remaining test objects were removed by UID and the original snapshot restored.
+The interrupted test's transaction was closed; no active transactions remained
+before or after the final run.
 
-Altium при перерисовке увеличил ширину слишком узкого тестового порта, чтобы
-вместить его имя. Для проверки точной геометрии использован порт с достаточной
-шириной; поведение автоподбора описано в документации инструмента.
+Altium expanded a narrow test port to fit its name during redraw. Exact geometry
+checks then used sufficient width; this behavior is documented in the API guide.
 
-Диагностические `run_altium_script` использованы для чтения UID, проверки
-исполнителя/ProcessDepth и завершения транзакции прерванного теста. Добавление,
-изменение, удаление и финальный снимок выполнены через новую постоянную команду
-`edit_schematic(sheet_path, operations)`.
+Diagnostic `run_altium_script` calls read UIDs, checked executor/ProcessDepth and
+closed the interrupted test transaction. Add/update/delete and final inventory
+used the permanent `edit_schematic(sheet_path, operations)` command.
 
-## Состояние после проверки
+## Final state and limits
 
-Сохранение и сброс Modified не вызывались. Только `Display.SchDoc` отмечен
-как изменённый в памяти после тестовых транзакций; исходные поддерживаемые
-объекты восстановлены, файловые хеши совпадают. Это ожидаемый результат теста
-без сохранения. Полный ERC, электрическая корректность произвольных новых схем
-и все возможные стили/многосекционные символы этим прогоном не проверялись.
+No save or Modified reset was called. Only `Display.SchDoc` remained marked
+modified after the test transactions; original supported objects were restored
+and disk hashes matched. Full ERC, arbitrary circuit correctness and every
+symbol style/multipart configuration were not covered by this run.

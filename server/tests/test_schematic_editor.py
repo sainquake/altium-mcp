@@ -37,7 +37,7 @@ class SchematicEditTest(unittest.TestCase):
                 validate_request(path, [])
 
     def test_transport_keeps_unicode_delimiters_and_line_breaks(self):
-        value = "Тест | , = \\\n\r\t\"'"
+        value = "\u0422\u0435\u0441\u0442 | , = \\\n\r\t\"'"
         spec = self.validate([self.add("component", source_designator="R1", designator="R999",
                                        x=10.5, y=20, comment=value, parameters={"Test=one": value})])
         fields = dict(line.split("=", 1) for line in spec.splitlines())
