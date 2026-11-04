@@ -1,10 +1,12 @@
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.fastmcp.utilities.types import Image as MCPImage
+from mcp.types import ToolAnnotations
 import json
 import os
 import time
 import asyncio
 import logging
+import logging.handlers
 import subprocess
 import tkinter as tk
 from tkinter import filedialog
@@ -17,14 +19,21 @@ import win32con
 import win32api
 import win32process
 from PIL import Image
-import io
-import base64
 import glob
+import io
 import re
+import silkscreen
+import label_blocks
+import script_bundle
+import pcblib_file
 import uuid
 
-from altium_files import read_altium_text, write_altium_text
+from altium_files import long_path, read_altium_text, write_altium_text
+from exchange_lock import ExchangeLock
+from altium_install import find_altium_exe
+import routing
 import sandbox
+import win_processes
 from outjob_parser import parse_outjob
 from schematic_editor import validate_request as validate_schematic_edit
 import schematic_connectivity
@@ -39,17 +48,6 @@ from server_info import capture_runtime_info
 SERVER_INFO = capture_runtime_info()
 SERVER_STARTED_MONOTONIC = time.monotonic()
 
-# Configure logging
-logging.basicConfig(
-    level=logging.DEBUG,  # Change to DEBUG for more detailed logs
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stderr),  # Keep stdout reserved for MCP messages
-        logging.FileHandler(str(Path(__file__).with_name('altium_mcp.log')))  # Also log to file
-    ]
-)
-logger = logging.getLogger("AltiumMCPServer")
-
 # Set MCP_DIR to the directory of the current Python file
 MCP_DIR = Path(__file__).parent
 # config.json lives in a per-user folder OUTSIDE the install directory and
@@ -61,6 +59,44 @@ MCP_DIR = Path(__file__).parent
 def _data_dir() -> Path:
     override = os.environ.get("ALTIUM_MCP_HOME")
     return Path(override) if override else Path.home() / ".altium-mcp"
+
+
+class _RotatingLog(logging.handlers.RotatingFileHandler):
+    """Rotates like its base class, but keeps logging when it cannot.
+
+    Windows will not rename a file another process has open, and two servers
+    (two Claude sessions) often share this log. The base class then fails
+    on every record; this one keeps appending and leaves the rotation to the
+    next server that starts alone.
+    """
+
+    def doRollover(self):
+        try:
+            super().doRollover()
+        except OSError:
+            self.maxBytes = 0
+            if self.stream is None:
+                self.stream = self._open()
+
+
+# The log sits beside config.json, for the same reasons, and rotates at
+# 1 MB with 3 backups. INFO by default: DEBUG adds a line for every MCP
+# protocol message. Set ALTIUM_MCP_LOG_LEVEL=DEBUG to get them back.
+LOG_FILE = _data_dir() / "altium_mcp.log"
+_log_level = logging.getLevelName(os.environ.get("ALTIUM_MCP_LOG_LEVEL", "INFO").upper())
+_log_handlers = [logging.StreamHandler()]  # stderr: stdout carries the MCP protocol
+try:
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _log_handlers.append(_RotatingLog(str(LOG_FILE), maxBytes=1_000_000, backupCount=3,
+                                      encoding="utf-8"))
+except OSError:
+    pass  # no log file is no reason not to start
+logging.basicConfig(
+    level=_log_level if isinstance(_log_level, int) else logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=_log_handlers
+)
+logger = logging.getLogger("AltiumMCPServer")
 
 LEGACY_CONFIG_FILE = MCP_DIR / "config.json"
 CONFIG_FILE = _data_dir() / "config.json"
@@ -76,11 +112,57 @@ EXCHANGE_DIR.mkdir(exist_ok=True)
 REQUEST_FILE = EXCHANGE_DIR / "request.json"
 RESPONSE_FILE = EXCHANGE_DIR / "response.json"
 
+# Written by the bridge script when it starts a command and, at most once a
+# second, while a long command (a batch) is still working
+PROGRESS_FILE = EXCHANGE_DIR / "progress.txt"
+
+# Copies of command results (design data) that older bridge scripts left in
+# this folder, which every account on the machine can read. Nothing reads
+# them. Named one by one: users keep their own script output here too.
+LEFTOVER_TEMP_FILES = (
+    "temp_board_summary.json", "temp_component_data.json",
+    "temp_component_primitives.json", "temp_erc.json",
+    "temp_footprint_primitives.json", "temp_json_output.json",
+    "temp_layers_data.json", "temp_net_connections.json", "temp_nets_data.json",
+    "temp_pins_data.json", "temp_project_components.json",
+    "temp_project_info.json", "temp_rules_data.json",
+    "temp_schematic_data.json", "temp_search_symbol.json",
+    "temp_selected_components.json", "temp_stackup_data.json",
+    "temp_symbol_primitives.json", "temp_symbol_reference.json",
+)
+
+
+def _remove_leftover_temp_files(folder: Path = EXCHANGE_DIR):
+    for name in LEFTOVER_TEMP_FILES:
+        try:
+            (folder / name).unlink()
+        except OSError:
+            pass  # absent, or held open: best effort
+
+
+_remove_leftover_temp_files()
+
 # Seconds for a running Altium to pick up a request (normally ~1-5 s), for a
-# cold Altium launch to get that far, and for a started command to finish
+# cold Altium launch to get that far, for a started command to go without
+# reporting progress, and for any command to finish at all
 START_TIMEOUT = 20
 START_TIMEOUT_COLD = 240
 RESPONSE_TIMEOUT = 120
+RESPONSE_TIMEOUT_MAX = 30 * 60
+
+# How long to wait while another server's command holds the exchange folder
+LOCK_TIMEOUT = START_TIMEOUT_COLD + RESPONSE_TIMEOUT
+
+# Commands that change the design or write files. When one of them times out
+# it may have done some or all of its work, so it must not just be retried.
+MUTATING_COMMANDS = {
+    "create_net_class", "create_schematic_symbol", "set_component_position",
+    "move_components", "place_components", "create_symbols_batch", "build_circuit",
+    "create_footprints_batch", "layout_duplicator", "layout_duplicator_apply",
+    "run_output_jobs", "create_pcb_footprint", "edit_schematic", "edit_schematic_actions",
+    "set_library_component_data", "create_document", "open_document", "save_document",
+    "add_document_to_project", "open_project", "select_project",
+}
 
 # Present while a script the MCP launched is stuck (paused in Altium's
 # debugger). Only then is the debugger stopped, so a script the user is
@@ -102,6 +184,34 @@ def _clear_script_stuck():
     except OSError:
         pass
 
+
+ALTIUM_HUNG_ERROR = (
+    "Not run: Altium is not responding. A script or a long command is still running in it, or "
+    "a script is stuck in a loop. Nothing can be sent to Altium until it finishes. Scripts "
+    "started by run_altium_script stop their while/repeat loops at their deadline; if Altium "
+    "stays frozen, only ending X2.EXE frees it, and unsaved work is then lost.")
+
+
+def _lift_failed_result(response: Dict[str, Any]) -> Dict[str, Any]:
+    """Make a command's own failure the response's failure.
+
+    Several bridge commands report failure as their result, e.g.
+    {"success": false, "error": "No layer names provided"}, and the bridge
+    wraps any result in "success": true. Tools then took the failure for
+    success: get_screenshot even captured after its focus step had failed.
+    Fields besides the message (per-container results of run_output_jobs,
+    for instance) are kept in the error text.
+    """
+    result = response.get("result")
+    if response.get("success") and isinstance(result, dict) and result.get("success") is False:
+        error = result.get("error") or result.get("message") or "the command reported failure"
+        details = {k: v for k, v in result.items() if k not in ("success", "error", "message")}
+        if details:
+            error = f"{error} {json.dumps(details)[:2000]}"
+        return {**response, "success": False, "error": error}
+    return response
+
+
 # Instructions exposed to MCP clients during initialization.
 AGENT_INSTRUCTIONS = """Prefer dedicated Altium MCP tools. Before using custom DelphiScript through
 run_altium_script for a new operation, tell the user in their language what
@@ -122,13 +232,21 @@ an existing dedicated tool covers it.
 """
 
 # Initialize FastMCP server
-mcp = FastMCP(
-    "AltiumMCP",
-    instructions=AGENT_INSTRUCTIONS,
-    description="Altium integration through the Model Context Protocol",
-)
-# FastMCP 1.5 has no public version parameter; set the protocol server's version.
+mcp = FastMCP("AltiumMCP", instructions=AGENT_INSTRUCTIONS)
 mcp._mcp_server.version = SERVER_INFO["server_version"]
+
+READ_ONLY = ToolAnnotations(readOnlyHint=True)
+
+
+def _tool(read_only: bool = False):
+    """Register a tool.
+
+    read_only marks a tool that only reads from Altium, so clients can tell it
+    from the tools that change a design. Results stay plain text content: by
+    default mcp would infer an output schema from "-> str" and send every
+    result twice, once more as structuredContent.
+    """
+    return mcp.tool(annotations=READ_ONLY if read_only else None, structured_output=False)
 
 class AltiumConfig:
     def __init__(self):
@@ -163,38 +281,8 @@ class AltiumConfig:
             self._create_default_config()
 
     def _create_default_config(self):
-        """Create a default configuration file with improved Altium executable discovery"""
-        
-        # Try to find Altium directories dynamically
-        altium_base_path = r"C:\Program Files\Altium"
-        altium_exe_path = None
-        
-        if os.path.exists(altium_base_path):
-            # Find all directories that match the pattern AD*
-            ad_dirs = glob.glob(os.path.join(altium_base_path, "AD*"))
-            
-            if ad_dirs:
-                # Sort directories by version number (extract the number after "AD")
-                def get_version_number(dir_path):
-                    match = re.search(r"AD(\d+)", os.path.basename(dir_path))
-                    if match:
-                        return int(match.group(1))
-                    return 0
-                
-                # Sort directories by version number (highest first)
-                ad_dirs.sort(key=get_version_number, reverse=True)
-                
-                # Try each directory until we find one with X2.EXE
-                for ad_dir in ad_dirs:
-                    potential_exe = os.path.join(ad_dir, "X2.EXE")
-                    if os.path.exists(potential_exe):
-                        altium_exe_path = potential_exe
-                        break
-        
-        # Set the found path (or empty string if nothing found)
-        self.altium_exe_path = altium_exe_path if altium_exe_path else ""
-        
-        # Save the configuration
+        """Create a default configuration file, with Altium's path if it can be found"""
+        self.altium_exe_path = find_altium_exe()
         self.save_config()
     
     def _as_dict(self):
@@ -221,87 +309,70 @@ class AltiumConfig:
         except Exception as e:
             logger.error(f"Error saving configuration: {e}")
 
+    def discover_altium(self) -> bool:
+        """Keep the saved Altium path if it still exists, else look for one.
+
+        Never asks the user, so it is safe at import time. Called again
+        before commands, so an Altium started after the server, or one
+        updated to a new folder, is picked up without a restart.
+        """
+        if self.altium_exe_path and os.path.exists(self.altium_exe_path):
+            return True
+        found = find_altium_exe()
+        if not found:
+            return False
+        logger.info(f"Automatically found Altium at: {found}")
+        self.altium_exe_path = found
+        self.save_config()
+        return True
+
     def verify_paths(self):
-        """Verify that the paths in the configuration exist, prompt for input if they don't"""
+        """Verify that the paths in the configuration exist, prompt for input if they don't
+
+        Shows file dialogs, so it must not run on the event loop, and never
+        before the server has answered the client's initialize request: a
+        dialog nobody sees would hold the startup until the client gives up.
+        Messages go to the log only; under the stdio transport stdout is the
+        protocol channel.
+        """
 
         # Initialize variables
         root = None
         paths_verified = True
-        
+
         # Check Altium executable
-        if not self.altium_exe_path or not os.path.exists(self.altium_exe_path):
-            paths_verified = False
-            
-            # Before prompting, try an automatic discovery
-            altium_base_path = r"C:\Program Files\Altium"
-            if os.path.exists(altium_base_path):
-                logger.info(f"Attempting automatic discovery in {altium_base_path}")
-                # Find all directories that match the pattern AD*
-                ad_dirs = glob.glob(os.path.join(altium_base_path, "AD*"))
-                
-                if ad_dirs:
-                    # Sort directories by version number (extract the number after "AD")
-                    def get_version_number(dir_path):
-                        match = re.search(r"AD(\d+)", os.path.basename(dir_path))
-                        if match:
-                            return int(match.group(1))
-                        return 0
-                    
-                    # Sort directories by version number (highest first)
-                    ad_dirs.sort(key=get_version_number, reverse=True)
-                    
-                    # Try each directory until we find one with X2.EXE
-                    for ad_dir in ad_dirs:
-                        potential_exe = os.path.join(ad_dir, "X2.EXE")
-                        if os.path.exists(potential_exe):
-                            self.altium_exe_path = potential_exe
-                            logger.info(f"Automatically found Altium at: {self.altium_exe_path}")
-                            paths_verified = True
-                            break
-            
-            # If automatic discovery failed, prompt for input
-            if not self.altium_exe_path or not os.path.exists(self.altium_exe_path):
-                if root is None:
-                    import tkinter as tk
-                    from tkinter import filedialog
-                    root = tk.Tk()
-                    root.withdraw()  # Hide the main window
-                
-                logger.info(
-                    "Altium executable not found. Searched in %s; last known path: %s. "
-                    "Please select the Altium X2.EXE file...",
-                    r"C:\Program Files\Altium\AD*\X2.EXE",
-                    self.altium_exe_path,
-                )
-                
-                self.altium_exe_path = filedialog.askopenfilename(
-                    title="Select Altium Executable",
-                    filetypes=[("Executable files", "*.exe")],  # Only allow .exe files
-                    initialdir="C:/Program Files/Altium"
-                )
-                
-                if not self.altium_exe_path:
-                    logger.error("No Altium executable selected. Automatic script execution will be disabled.")
-                    paths_verified = False
-        
+        if not self.discover_altium():
+            root = self._dialog_root()
+            logger.info("Altium executable not found in the registry, among running "
+                        "processes or under C:\\Program Files\\Altium. Prompting user for selection...")
+
+            self.altium_exe_path = filedialog.askopenfilename(
+                parent=root,
+                title="Select Altium Executable (X2.EXE)",
+                filetypes=[("Executable files", "*.exe")],  # Only allow .exe files
+                initialdir="C:/Program Files/Altium"
+            )
+
+            if not self.altium_exe_path:
+                logger.error("No Altium executable selected. Some functionality may not work.")
+                paths_verified = False
+
         # Check script path
         if not os.path.exists(self.script_path):
             paths_verified = False
-            
+
             if root is None:
-                import tkinter as tk
-                from tkinter import filedialog
-                root = tk.Tk()
-                root.withdraw()  # Hide the main window
-            
+                root = self._dialog_root()
+
             logger.info(f"Script file not found at {self.script_path}. Prompting user for selection...")
-            
+
             selected_path = filedialog.askopenfilename(
+                parent=root,
                 title="Select Altium Project File",
                 filetypes=[("Altium Project files", "*.PrjScr")],  # Changed to PrjScr for script project
                 initialdir=str(MCP_DIR)
             )
-            
+
             if selected_path:
                 self.script_path = selected_path
             else:
@@ -314,33 +385,182 @@ class AltiumConfig:
         
         # Save the updated configuration
         self.save_config()
-        
+
         return paths_verified
+
+    @staticmethod
+    def _dialog_root():
+        # A hidden, topmost owner window, so the file dialog opens in front of
+        # the client instead of behind it where nobody notices it
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        return root
+
+
+# Two Altium resources run out over a long session, and at either limit
+# Altium fails and then crashes, losing unsaved work:
+# - USER objects (windows, menus), capped per process at 10,000 by default.
+#   Running a script PROJECT leaked about 105 per call (hidden copies of the
+#   forms of the user's menu scripts); the bridge now runs a script file,
+#   but the user's own menu scripts still leak.
+# - Memory: Altium's script engine leaks a little on every property read of
+#   a board object, about 25 MB per silkscreen export on a 40k-object board
+#   and 50 MB per full silkscreen check, and never gives it back.
+# Calls stop while there is still room to save.
+USER_OBJECT_RESERVE = 1000
+MEMORY_SHARE_LIMIT = 0.5        # of physical RAM
+
+def altium_resources() -> Optional[dict]:
+    """USER objects, their quota, private memory and the machine's RAM (MB)
+    for the running Altium, or None when it is not running."""
+    import ctypes
+    from ctypes import wintypes
+
+    class MemCounters(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
+                    ("PrivateUsage", ctypes.c_size_t)]
+
+    class MemStatus(ctypes.Structure):
+        _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows") as key:
+            quota = int(winreg.QueryValueEx(key, "USERProcessHandleQuota")[0])
+    except OSError:
+        quota = 10000
+    kernel32, user32, psapi = ctypes.windll.kernel32, ctypes.windll.user32, ctypes.windll.psapi
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    status = MemStatus()
+    status.dwLength = ctypes.sizeof(MemStatus)
+    kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+    found = None
+    for pid in win32process.EnumProcesses():
+        handle = kernel32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            continue
+        try:
+            name = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(1024)
+            if (kernel32.QueryFullProcessImageNameW(handle, 0, name, ctypes.byref(size))
+                    and os.path.basename(name.value).upper() == "X2.EXE"):
+                counters = MemCounters()
+                counters.cb = ctypes.sizeof(MemCounters)
+                psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb)
+                # Launcher instances are short-lived; the main one is the biggest
+                here = {"user_objects": user32.GetGuiResources(handle, 1),     # GR_USEROBJECTS
+                        "private_mb": counters.PrivateUsage / 2 ** 20}
+                if found is None or here["private_mb"] > found["private_mb"]:
+                    found = here
+        finally:
+            kernel32.CloseHandle(handle)
+    if found is not None:
+        found.update(quota=quota, ram_mb=status.ullTotalPhys / 2 ** 20)
+    return found
+
+def altium_limit_problem() -> Optional[str]:
+    """Why calling into Altium now would risk a crash, or None."""
+    r = altium_resources()
+    if r is None:
+        return None
+    if r["user_objects"] > r["quota"] - USER_OBJECT_RESERVE:
+        return (f"Altium is using {r['user_objects']} of its {r['quota']} window handles and will fail, "
+                "then crash, near the limit. Ask the user to save their work in Altium and restart it.")
+    if r["private_mb"] > MEMORY_SHARE_LIMIT * r["ram_mb"]:
+        return (f"Altium is using {r['private_mb'] / 1024:.1f} GB of memory ({r['ram_mb'] / 1024:.0f} GB in the "
+                "machine); its script engine leaks memory on every call and it will run out. Ask the user "
+                "to save their work in Altium and restart it.")
+    return None
 
 class AltiumBridge:
     def __init__(self):
         # Ensure the MCP directory exists
         MCP_DIR.mkdir(exist_ok=True)
 
-        # Load configuration
+        # Load configuration. Finding Altium needs nobody, so it happens now;
+        # asking for a path waits for the first command (see ensure_paths)
         self.config = AltiumConfig()
-        self.config.verify_paths()
+        self.config.discover_altium()
+        self._asked_for_paths = False
 
         # Commands share a single request.json/response.json pair, so
-        # concurrent tool calls must be serialized or they clobber each other
+        # concurrent tool calls must be serialized or they clobber each other:
+        # within this server by the asyncio lock, and against other servers
+        # using the same exchange folder by the file lock
         self._command_lock = asyncio.Lock()
+        self._exchange_lock = ExchangeLock(EXCHANGE_DIR / "bridge.lock")
 
-    async def execute_command(self, command: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    async def ensure_paths(self, need_script: bool = True) -> Optional[str]:
+        """None when Altium (and the bridge script project) can be found,
+        else what is missing and where to set it.
+
+        The file dialogs of verify_paths are shown at most once per server
+        run, in a worker thread so the event loop keeps answering the
+        client; after that a missing path is reported straight away.
+        """
+        def missing():
+            if not self.config.discover_altium():
+                return "altium_exe_path"
+            if need_script and not os.path.exists(self.config.script_path):
+                return "script_path"
+            return None
+
+        if missing() and not self._asked_for_paths:
+            self._asked_for_paths = True
+            await asyncio.to_thread(self.config.verify_paths)
+        what = missing()
+        if what == "altium_exe_path":
+            return (f"Altium Designer was not found (looked in the registry, at running "
+                    f"processes and under C:\\Program Files\\Altium). Set \"altium_exe_path\" "
+                    f"in {CONFIG_FILE} to the full path of X2.EXE, then retry. The folder "
+                    f"holding config.json can be changed with the ALTIUM_MCP_HOME "
+                    f"environment variable.")
+        if what == "script_path":
+            return (f"The bridge script project was not found at {self.config.script_path}. "
+                    f"Reinstall the extension, or set \"script_path\" in {CONFIG_FILE} to "
+                    f"Altium_API.PrjScr, then retry.")
+        return None
+
+    async def execute_command(self, command: str, params: Dict[str, Any], timeout: float = RESPONSE_TIMEOUT) -> Dict[str, Any]:
         """Execute a command in Altium via the bridge script"""
         async with self._command_lock:
-            return await self._execute_command_locked(command, params)
+            problem = await self.ensure_paths()
+            if problem:
+                return {"success": False, "error": problem}
+            if not await self._exchange_lock.acquire(LOCK_TIMEOUT):
+                return {"success": False,
+                        "error": f"Not run: another Altium MCP server (another Claude session) "
+                                 f"has had a command running in Altium for over {LOCK_TIMEOUT} s. "
+                                 f"Retry when it has finished."}
+            try:
+                # A launch sent to a hung Altium only queues up behind whatever
+                # holds its UI thread; say so now instead of after the start
+                # timeout. Checked with the exchange lock held: while waiting
+                # for it, Altium is busy with another server's command, which
+                # is no reason to give up.
+                if await asyncio.to_thread(sandbox.altium_hung):
+                    return {"success": False, "error": ALTIUM_HUNG_ERROR}
+                response = await self._execute_command_locked(command, params, timeout)
+            finally:
+                self._exchange_lock.release()
+        return _lift_failed_result(response)
 
     @staticmethod
     def _altium_running() -> bool:
+        # Read in-process: starting tasklist took about 110 ms on every
+        # command and held up the event loop while it ran
         try:
-            out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq X2.EXE", "/NH"],
-                                 capture_output=True, text=True, timeout=10).stdout
-            return "X2.EXE" in out.upper()
+            return bool(win_processes.pids_by_name("X2.EXE"))
         except Exception:
             return True  # unknown: assume running and use the normal timeouts
 
@@ -379,17 +599,26 @@ class AltiumBridge:
         for _ in range(12):
             try:
                 text = read_altium_text(RESPONSE_FILE)
-                json.loads(text)
+                json.loads(text, strict=False)
                 return text
             except (OSError, json.JSONDecodeError):
                 await asyncio.sleep(0.25)
         return text
 
-    async def _execute_command_locked(self, command: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    async def _execute_command_locked(self, command: str, params: Dict[str, Any], timeout: float = RESPONSE_TIMEOUT) -> Dict[str, Any]:
         try:
-            # Clean up any existing response file
-            if RESPONSE_FILE.exists():
-                RESPONSE_FILE.unlink()
+            problem = altium_limit_problem()
+            if problem:
+                return {"success": False, "error": f"Not running '{command}': {problem}"}
+
+            # Holding the exchange lock, any reply or progress mark still
+            # here is left over from a command that timed out. A late writer
+            # may still hold it open; the request_id check below covers that.
+            for leftover in (RESPONSE_FILE, PROGRESS_FILE):
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass
 
             # The script echoes request_id so a late reply to an earlier,
             # timed-out command is never mistaken for this command's result
@@ -450,34 +679,60 @@ class AltiumBridge:
             _clear_script_stuck()
 
             logger.info("Bridge script started, waiting for response file...")
-            start_time = time.time()
-            while time.time() - start_time < RESPONSE_TIMEOUT:
-                if RESPONSE_FILE.exists():
+            # Wait as long as the command keeps reporting progress, up to
+            # RESPONSE_TIMEOUT_MAX: a large batch is not stopped mid-way
+            start_time = last_progress = time.monotonic()
+            progress_mark = None
+            response_text = None
+            ignored_reply = None
+            while response_text is None:
+                try:
+                    reply_mark = RESPONSE_FILE.stat().st_mtime
+                except OSError:
+                    reply_mark = None
+                if reply_mark is not None and reply_mark != ignored_reply:
                     response_text = await self._read_response_text()
                     try:
-                        rid = json.loads(response_text).get("request_id")
+                        rid = json.loads(response_text, strict=False).get("request_id")
                     except (json.JSONDecodeError, AttributeError):
                         rid = None
                     if rid is None or rid == request_id:
                         break
-                    logger.warning(f"Discarding stale response for request_id={rid}")
-                    try:
-                        RESPONSE_FILE.unlink()
-                    except OSError:
-                        pass
+                    # Someone else's reply: a late one, or that of a server
+                    # still without the exchange lock. Leave it for its owner;
+                    # ours overwrites it when it comes.
+                    logger.warning(f"Ignoring a reply for request_id={rid}")
+                    response_text, ignored_reply = None, reply_mark
+                now = time.monotonic()
+                try:
+                    mark = PROGRESS_FILE.stat().st_mtime
+                except OSError:
+                    mark = None
+                if mark != progress_mark:
+                    progress_mark, last_progress = mark, now
+                if now - last_progress > timeout or now - start_time > max(RESPONSE_TIMEOUT_MAX, timeout):
+                    break
                 await asyncio.sleep(0.25)
-            else:
+
+            if response_text is None:
                 logger.error("Timeout waiting for response from Altium")
                 # The script started but never finished: it is most likely
                 # paused in the debugger now. Unblock it for the next command.
                 _mark_script_stuck(f"bridge command {command}")
                 await self.stop_script_debugger()
+                # A command that changes the design may have done some or all
+                # of its work; a plain retry would then do it twice
+                outcome = (f" '{command}' changes the design and may have done some or all of "
+                           f"its work, so its outcome is unknown: check the design before "
+                           f"running it again." if command in MUTATING_COMMANDS else "")
                 return {"success": False,
-                        "error": f"No response from Altium within {RESPONSE_TIMEOUT}s: command "
-                                 f"'{command}' started but did not finish. It probably hit a "
-                                 f"runtime error and paused in Altium's debugger (now stopped, "
-                                 f"so the next command can run), or it is still working on a "
-                                 f"very large design."}
+                        "error": f"No response from Altium after "
+                                 f"{int(time.monotonic() - start_time)} s, the last "
+                                 f"{timeout:g} s without progress: command '{command}' "
+                                 f"started but did not finish. It probably hit a runtime error "
+                                 f"and paused in Altium's debugger (now stopped, so the next "
+                                 f"command can run), or it is still working on a very large "
+                                 f"design.{outcome}"}
 
             if recovered:
                 logger.info("Command succeeded after automatic executor recovery")
@@ -485,37 +740,17 @@ class AltiumBridge:
             # Log the raw response for debugging
             logger.info(f"Raw response (first 200 chars): {response_text[:200]}")
 
-            # Parse the JSON response with detailed error handling
+            # Parse the JSON response. strict=False accepts control characters
+            # inside strings: JSONEscapeString escapes only CR, LF and TAB, and
+            # Altium text (descriptions, parameters) can hold others.
             try:
-                response = json.loads(response_text)
+                response = json.loads(response_text, strict=False)
                 logger.info(f"Successfully parsed JSON response")
                 return response
             except json.JSONDecodeError as e:
                 logger.error(f"Error parsing JSON response: {e}")
                 logger.error(f"Error at position {e.pos}, line {e.lineno}, column {e.colno}")
                 logger.error(f"Character at error position: '{response_text[e.pos:e.pos+10]}...'")
-                
-                # Try to manually fix common JSON issues
-                logger.info("Attempting to fix JSON response...")
-                fixed_text = response_text
-                
-                # Fix 1: If there's a quoted JSON array, try to fix it
-                if '"[' in fixed_text and ']"' in fixed_text:
-                    fixed_text = fixed_text.replace('"[', '[').replace(']"', ']')
-                    logger.info("Fixed double-quoted JSON array")
-                
-                # Fix 2: Handle escaped quotes in JSON strings
-                fixed_text = fixed_text.replace('\\"', '"')
-                
-                # Try to parse the fixed JSON
-                try:
-                    fixed_response = json.loads(fixed_text)
-                    logger.info("Successfully parsed fixed JSON response")
-                    return fixed_response
-                except json.JSONDecodeError as e2:
-                    logger.error(f"Still failed to parse JSON after fixes: {e2}")
-                
-                # If all else fails, return a structured error
                 return {
                     "success": False, 
                     "error": f"Invalid JSON response: {e}",
@@ -574,8 +809,17 @@ class AltiumBridge:
             # outside the MSIX sandbox) can find the script files
             script_path = self._resolve_msix_path(self.config.script_path)
 
-            # Command format: "X2.EXE" -RScriptingSystem:RunScript(ProjectName="path\file.PrjScr"|ProcName="ModuleName>Run")
-            command = f'"{self.config.altium_exe_path}" -RScriptingSystem:RunScript(ProjectName="{script_path}"^|ProcName="Altium_API>Run")'
+            # Run the units merged into one script FILE: running the script
+            # project leaks window handles in Altium (see script_bundle.py).
+            # The project stays the source, and the fallback.
+            try:
+                bundle = script_bundle.ensure_bundle(script_path, EXCHANGE_DIR / "bridge")
+                command = (f'"{self.config.altium_exe_path}" -RScriptingSystem:RunScriptFile('
+                           f'FileName={bundle}^|ProcName=Run)')
+            except (OSError, ValueError) as e:
+                logger.warning(f"Could not build the script bundle ({e}); running the project")
+                command = (f'"{self.config.altium_exe_path}" -RScriptingSystem:RunScript('
+                           f'ProjectName="{script_path}"^|ProcName="Altium_API>Run")')
             
             logger.info(f"Running command: {command}")
             
@@ -593,7 +837,7 @@ class AltiumBridge:
 # Create a global bridge instance
 altium_bridge = AltiumBridge()
 
-@mcp.tool()
+@_tool(read_only=True)
 async def get_all_component_property_names(ctx: Context) -> str:
     """
     Get all available component property names (JSON keys) from all components
@@ -643,7 +887,7 @@ async def get_all_component_property_names(ctx: Context) -> str:
         logger.error(f"Error processing component data: {e}")
         return json.dumps({"error": f"Failed to process component data: {str(e)}"})
 
-@mcp.tool()
+@_tool(read_only=True)
 async def get_component_property_values(ctx: Context, property_name: str) -> str:
     """
     Get values of a specific property for all components
@@ -698,7 +942,7 @@ async def get_component_property_values(ctx: Context, property_name: str) -> str
         logger.error(f"Error processing component data: {e}")
         return json.dumps({"error": f"Failed to process component data: {str(e)}"})
     
-@mcp.tool()
+@_tool(read_only=True)
 async def get_symbol_placement_rules(ctx: Context) -> str:
     """
     Get schematic symbol placement rules from a local configuration file
@@ -717,11 +961,8 @@ async def get_symbol_placement_rules(ctx: Context) -> str:
         
         # Default rules content
         default_rules = (
-            "Only place pins on the left and right side of the symbol. "
-            "Place power rail pins at the upper right, ground pins in the bottom left, "
-            "no connect pins in the bottom right, inputs on the left, outputs on the right, "
-            "and try to group other pins together by similar functionality (for example, SPI, I2C, RGMII, etc.). "
-            "Always separate groups by 100mil gaps unless there is extra spacing, then space out groups equal distance from each other. "
+            "Your own pin placement rules, for example where power, ground, "
+            "inputs, outputs and no-connect pins go and how pin groups are spaced."
         )
         
         # Create a helpful message for the user
@@ -740,6 +981,8 @@ async def get_symbol_placement_rules(ctx: Context) -> str:
             rules_content = f.read()
         
         logger.info("Successfully read symbol placement rules file")
+        if not rules_content.strip():
+            rules_content = """No symbol placement rules are configured. Follow the conventions of a comparable symbol in the user's library (find one with search_library_symbol and read it with get_symbol_primitives) and any instructions from the user. Keep pins on a 100 mil grid so wires connect to them."""
         
         # Return the rules with a message about how to modify them
         result = {
@@ -757,7 +1000,7 @@ async def get_symbol_placement_rules(ctx: Context) -> str:
             "error": f"Failed to read rules file: {str(e)}"
         }, indent=2)
 
-@mcp.tool()
+@_tool(read_only=True)
 async def get_library_symbol_reference(ctx: Context) -> str:
     """
     Get the currently open symbol from a schematic library to use as reference for creating a new symbol.
@@ -790,7 +1033,7 @@ async def get_library_symbol_reference(ctx: Context) -> str:
     logger.info(f"Retrieved symbol reference data")
     return json.dumps(symbol_data, indent=2)
 
-@mcp.tool()
+@_tool(read_only=True)
 async def search_library_symbol(ctx: Context, symbol_name: str, library_path: str = "") -> str:
     """
     Search for a symbol by name in a schematic library (.SchLib) and navigate to it.
@@ -838,7 +1081,7 @@ async def search_library_symbol(ctx: Context, symbol_name: str, library_path: st
     logger.info(f"Symbol search complete. Found: {result.get('found', False)}")
     return json.dumps(result, indent=2)
 
-@mcp.tool()
+@_tool()
 async def create_schematic_symbol(ctx: Context, symbol_name: str, description: str, pins: list,
                                   parameters: dict, part_count: int = 1, graphics: list = None) -> str:
     r"""
@@ -858,8 +1101,8 @@ async def create_schematic_symbol(ctx: Context, symbol_name: str, description: s
     a missing reference as an error.
 
     Create a new schematic symbol in the current library with the specified pins
-    Instructions: pins should be grouped together via function and only placed on
-                  the left and right side in 100 mil increments
+    Instructions: follow the rules from get_symbol_placement_rules and the
+                  reference symbol's conventions; keep pins on a 100 mil grid
 
     Pin name inversion/overbar: To show an overbar on a pin name (for active-low signals),
                   place a backslash after EACH character that should be overbarred.
@@ -884,7 +1127,9 @@ async def create_schematic_symbol(ctx: Context, symbol_name: str, description: s
                     "pin_number|pin_name|pin_type|pin_orientation|x|y[|owner_part_id[|length[|show_name[|show_designator]]]]"
                     Pin types: eElectricHiZ, eElectricInput, eElectricIO, eElectricOpenCollector,
                                eElectricOpenEmitter, eElectricOutput, eElectricPassive, eElectricPower
-                    Pin orientations: eRotate0 (right), eRotate90 (down), eRotate180 (left), eRotate270 (up)
+                    Pin orientations: eRotate0 (right), eRotate90 (up), eRotate180 (left), eRotate270 (down)
+                    x, y is where the pin meets the body; the pin extends from there
+                    in its orientation's direction (left-side pins eRotate180, top pins eRotate90)
                     X,Y coordinates in mils
                     owner_part_id (optional): Part number the pin belongs to (1-based).
                                Use 0 for pins shared across all parts (e.g. power/GND).
@@ -954,7 +1199,7 @@ async def create_schematic_symbol(ctx: Context, symbol_name: str, description: s
     logger.info(f"Symbol {symbol_name} created successfully with {len(pins)} pins")
     return json.dumps(result, indent=2)
 
-@mcp.tool()
+@_tool(read_only=True)
 async def get_schematic_data(ctx: Context, cmp_designators: list) -> str:
     """
     Get schematic data for components in Altium
@@ -1022,7 +1267,7 @@ async def get_schematic_data(ctx: Context, cmp_designators: list) -> str:
         logger.error(f"Error processing schematic data: {e}")
         return json.dumps({"error": f"Failed to process schematic data: {str(e)}"})
     
-@mcp.tool()
+@_tool(read_only=True)
 async def get_pcb_layers(ctx: Context) -> str:
     """
     Get detailed information about all layers in the current Altium PCB
@@ -1055,14 +1300,20 @@ async def get_pcb_layers(ctx: Context) -> str:
     logger.info(f"Retrieved PCB layers data")
     return json.dumps(layers_data, indent=2)
 
-@mcp.tool()
-async def set_pcb_layer_visibility(ctx: Context, layer_names: list, visible: bool) -> str:
+@_tool()
+async def set_pcb_layer_visibility(ctx: Context, layer_names: list, visible: bool, exclusive: bool = True) -> str:
     """
     Set visibility for specified PCB layers
-    
+
+    Showing layers is exclusive by default: the listed layers are shown and
+    every other layer is hidden, which suits a screenshot of just those
+    layers. Pass exclusive=False to show the listed layers and leave the rest
+    as they are. Hiding only ever hides the listed layers.
+
     Args:
         layer_names (list): List of layer names to modify (e.g., ["Top Layer", "Bottom Layer", "Mechanical 1"])
         visible (bool): Whether to show (True) or hide (False) the specified layers
+        exclusive (bool): With visible=True, hide every layer not listed (default True)
         
     Returns:
         str: JSON object with the result of the operation
@@ -1074,7 +1325,8 @@ async def set_pcb_layer_visibility(ctx: Context, layer_names: list, visible: boo
         "set_pcb_layer_visibility",
         {
             "layer_names": layer_names,
-            "visible": visible
+            "visible": visible,
+            "exclusive": exclusive
         }
     )
     
@@ -1090,7 +1342,7 @@ async def set_pcb_layer_visibility(ctx: Context, layer_names: list, visible: boo
     logger.info(f"Layer visibility set successfully")
     return json.dumps(result, indent=2)
 
-@mcp.tool()
+@_tool(read_only=True)
 async def get_component_data(ctx: Context, cmp_designators: list) -> str:
     """
     Get all data for components in Altium
@@ -1158,7 +1410,7 @@ async def get_component_data(ctx: Context, cmp_designators: list) -> str:
         logger.error(f"Error processing component data: {e}")
         return json.dumps({"error": f"Failed to process component data: {str(e)}"})
 
-@mcp.tool()
+@_tool(read_only=True)
 async def get_selected_components_coordinates(ctx: Context) -> str:
     """
     Get coordinates and positioning information for selected components in Altium layout
@@ -1190,7 +1442,7 @@ async def get_selected_components_coordinates(ctx: Context) -> str:
     logger.info(f"Retrieved positioning data for selected components")
     return json.dumps(components_coords, indent=2)
 
-@mcp.tool()
+@_tool(read_only=True)
 async def get_all_designators(ctx: Context) -> str:
     """
     Get all component designators from the current Altium board
@@ -1235,7 +1487,7 @@ async def get_all_designators(ctx: Context) -> str:
         logger.error(f"Error processing component data: {e}")
         return json.dumps({"error": f"Failed to process component data: {str(e)}"})
 
-@mcp.tool()
+@_tool(read_only=True)
 async def get_component_pins(ctx: Context, cmp_designators: list) -> str:
     """
     Get pin data for components in Altium
@@ -1285,6 +1537,8 @@ SANDBOX_PAS = SANDBOX_DIR / "Sandbox.pas"
 # Run files live in the exchange folder: Altium runs outside Claude Desktop's
 # MSIX package and cannot see the virtualized AppData path (issue #19)
 SANDBOX_RUNS = EXCHANGE_DIR / "runs"
+# Pictures of the dialogs a run answered (their text is often not readable)
+SANDBOX_DIALOGS = EXCHANGE_DIR / "dialogs"
 
 
 def _window_process_name(hwnd) -> str:
@@ -1366,8 +1620,9 @@ def _sandbox() -> sandbox.Sandbox:
                            template=SANDBOX_PAS, runs_dir=SANDBOX_RUNS)
 
 
-@mcp.tool()
-async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 120) -> str:
+@_tool()
+async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 120,
+                            skip_lint: bool = False) -> str:
     """
     Run a DelphiScript snippet inside an isolated Altium sandbox and report
     what happened, step by step.
@@ -1402,9 +1657,18 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
               X, Y : Integer;
       or reuse the scratch variables S1..S9 (String), I1..I9 and B1..B3
       (Integer), F1..F4 (Double), Obj1..Obj9 (IDispatch), List1..List3
-      (TStringList), IntMan, DbDoc. Assigning an undeclared plain name is
+      (TStringList, created empty by the sandbox - reuse with .Clear, never
+      Free them), IntMan, DbDoc. Assigning an undeclared plain name is
       refused before Altium is called. Do not assign to a for-loop variable
       inside its loop (compile error).
+    - Calls known to crash Altium (GetState_DescriptionString, reading
+      .Corner or .BoundingRectangle through an IDispatch variable, ...) and
+      a PreProcess without PostProcess are refused before Altium is called:
+      a script that dies between PreProcess and PostProcess leaves Altium's
+      undo history broken until Altium is restarted.
+    - Every dialog the tool answers is saved as a picture first, listed in
+      "dialog_snapshots": Altium's own message boxes cannot be read from
+      outside, so open the picture to see the message.
     - Helpers: MM(mm) converts millimetres to internal units;
       OpenSchDoc(path) returns the ISch_Document, opening the file if needed
       (GetSchDocumentByPath alone returns nil for a closed file, and a call on
@@ -1412,11 +1676,29 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
     - Errors inside the script (undeclared identifiers, calls on nil, bad
       conversions) are caught by the sandbox and come back as "script error"
       with Altium's message and the last step; no try/except is needed.
+    - Loops: a running script cannot be stopped from outside, so a loop that
+      never ends would freeze Altium until it is killed. Every while and
+      repeat loop is therefore guarded: about 10 s before timeout_seconds all
+      loops exit, the rest of the script still runs (so a PostProcess after
+      the loop is not skipped), SaveDoc no longer saves, and the tool returns
+      "loop guard" with the loop's line. Make loops that delete or retry
+      objects bounded anyway (a fixed count, never the same object twice).
+      for loops are not guarded.
     - The sandbox is standalone: helpers and constants from the production
       units (TrimJSON, AddJSONProperty, ...) are NOT available; REPLACEALL is.
+    - Undo: wrap each edit in SchServer.ProcessControl.PreProcess(Doc, '') /
+      PostProcess(Doc, '') (PCBServer.PreProcess / PostProcess on a PCB), and
+      report changes to the robot manager (SCHM_PrimitiveRegistration for a new
+      object, SCHM_BeginModify / SCHM_EndModify around a change). An undo group
+      left open makes the user's own later edits in that document impossible
+      to undo until Altium restarts, so the sandbox closes any group the script
+      leaves open, even after an error, and reports it as
+      "undo_groups_closed": fix the script when you see it.
     - Never register objects into a library document and never write to shared
       or network library paths. Verify the target document kind first
       (ObjectID 32 = schematic, 33 = symbol library).
+    - Copper: add routed tracks with route_track instead of computing segment
+      ends here, and run check_routing after moving tracks, vias or parts.
 
     For API guidance - interfaces, object models, worked examples - use the
     "altium-script" skill. ensure_altium_script_skill reports whether that
@@ -1426,6 +1708,8 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
         script (str): DelphiScript statements to execute (body only, optionally
             preceded by a var block).
         timeout_seconds (int): How long to wait for completion (default 120).
+        skip_lint (bool): Run even though the known-crash check refused the
+            script. Only for a false positive.
 
     Returns:
         str: JSON with success, the step log and the script's ResultText; on
@@ -1437,12 +1721,32 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
     if not SANDBOX_PAS.exists():
         return json.dumps({"success": False, "error": f"sandbox template missing: {SANDBOX_PAS}"})
 
+    problem = altium_limit_problem()
+    if problem:
+        return json.dumps({"success": False, "error": problem})
+
     split = sandbox.split_var_block(script)
     problems = sandbox.check_script(split.body, sandbox.declared_names(split.decls), split.body_offset)
     if problems:
         return json.dumps({"success": False,
                            "error": "refused before execution: the script would not compile",
                            "problems": problems, "executor_wedged": False}, indent=2)
+    if not skip_lint:
+        problems = sandbox.lint_script(split.body, split.body_offset, split.decls)
+        if problems:
+            return json.dumps({"success": False,
+                               "error": "refused before execution: the script uses a call known to "
+                                        "crash Altium or leaves a document edit open",
+                               "problems": problems,
+                               "note": "Altium was not touched. Pass skip_lint=True only for a false positive.",
+                               "executor_wedged": False}, indent=2)
+
+    problem = await altium_bridge.ensure_paths(need_script=False)
+    if problem:
+        return json.dumps({"success": False, "error": problem, "executor_wedged": False}, indent=2)
+
+    if await asyncio.to_thread(sandbox.altium_hung):
+        return json.dumps({"success": False, "error": ALTIUM_HUNG_ERROR, "executor_wedged": False}, indent=2)
 
     sb = _sandbox()
     report = {}
@@ -1459,9 +1763,12 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
         if report["recovered_before_run"]["recovered"]:
             _clear_script_stuck()
 
+    # The loops stop early enough for the script to finish and its result to
+    # arrive before this tool gives up on it
+    guard_seconds = max(5, timeout_seconds - 10)
     try:
         files = sb.new_run_files()
-        built = sb.write(files, script)
+        built = sb.write(files, script, guard_seconds)
     except Exception as e:
         return json.dumps({"success": False, "error": f"could not write the run file: {e}"})
     sb.launch(files)
@@ -1471,7 +1778,17 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
     # Keyed by window: a dialog that ignores WM_CLOSE (Yes/No boxes do) is
     # found again on every pass and must be reported once
     dismissed = {}
+    snapshots = {}
     error_dialog = None
+
+    def snapshot(d):
+        if d.hwnd not in snapshots:
+            try:
+                snapshots[d.hwnd] = sandbox.snapshot_dialog(d, SANDBOX_DIALOGS)
+            except Exception as e:
+                logger.warning(f"dialog snapshot failed: {e}")
+                snapshots[d.hwnd] = None
+
     while not files.result.exists() and time.time() - start < timeout_seconds:
         await asyncio.sleep(0.5)
         for d in sandbox.altium_dialogs():
@@ -1481,9 +1798,11 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
             if d.is_script_error or (d.cls == "TMessageForm" and d.title == "Error"
                                      and not files.log.exists()):
                 error_dialog = d
+                snapshot(d)
                 sandbox.answer_dialog(d)
                 break
             if time.time() - start > 6:
+                snapshot(d)
                 sandbox.answer_dialog(d)
                 dismissed[d.hwnd] = d
         if error_dialog:
@@ -1491,6 +1810,7 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
 
     report["dialogs_dismissed"] = len(dismissed)
     report["dismissed_dialog_titles"] = [d.title for d in dismissed.values()]
+    report["dialog_snapshots"] = [p for p in snapshots.values() if p]
     steps = (sandbox.read_when_ready(files.log, read_altium_text).splitlines()
              if files.log.exists() else [])
 
@@ -1498,6 +1818,27 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
         _clear_script_stuck()  # our script ran to the end: Altium is free
         result_text = sandbox.read_when_ready(files.result, read_altium_text).strip()
         sb.prune()
+        closed = [s[len(sandbox.UNDO_PREFIX):] for s in steps if s.startswith(sandbox.UNDO_PREFIX)]
+        if closed:
+            report["undo_groups_closed"] = closed
+            report["undo_warning"] = (
+                "The script called PreProcess without a matching PostProcess (or failed between "
+                "them). The sandbox closed the group so the user can still undo their own edits "
+                "in that document; pair every PreProcess with a PostProcess.")
+        guard = next((s for s in steps if s.startswith(sandbox.GUARD_PREFIX)), None)
+        if guard is not None:
+            m = re.search(r"line (\d+)", guard)
+            return json.dumps({
+                "success": False,
+                "error": "loop guard",
+                "altium_message": guard[len(sandbox.GUARD_PREFIX):],
+                "line": int(m.group(1)) if m else None,
+                "diagnosis": f"A while or repeat loop was still running after {guard_seconds} s, "
+                             "so every loop was cut short and the script ran to its end; Altium is "
+                             "free again. Statements after the loops ran on partial results and "
+                             "SaveDoc did not save: check the document before saving it. Make the "
+                             "loop bounded (a fixed count, never retrying the same object).",
+                "result": result_text, "steps": steps, "executor_wedged": False, **report}, indent=2)
         exc = next((s for s in steps if s.startswith(sandbox.EXCEPTION_PREFIX)), None)
         if exc is not None:
             before = steps[:steps.index(exc)]
@@ -1518,14 +1859,21 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
         recovery = await asyncio.to_thread(sb.recover)
         if recovery["recovered"]:
             _clear_script_stuck()
+            # The script stopped before its end, so the template could not
+            # close the undo groups it had opened; a group left open makes
+            # the user's own edits in that document impossible to undo
+            closed = await asyncio.to_thread(sb.close_leftover_undo, files)
+            if closed:
+                report["undo_groups_closed"] = closed
         started = bool(steps)
         return json.dumps({
             "success": False,
             "error": "run-time error" if started else "compile error",
             "altium_message": error_dialog.text or (
                 "Altium showed an Error box before the script started; its text cannot be read "
-                "from outside Altium. This is usually a syntax error (for example a construct "
-                "DelphiScript does not support, such as 'on E: Exception do')."),
+                "from outside Altium - open the picture in 'dialog_snapshots'. This is usually "
+                "a syntax error (for example a construct DelphiScript does not support, such "
+                "as 'on E: Exception do')."),
             "location": sandbox.map_error_line(built, error_dialog.text),
             "last_step_reached": steps[-1] if steps else None,
             "diagnosis": ("The script started; the statement at 'location' failed while running "
@@ -1542,6 +1890,22 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
             "diagnosis": f"Altium was asked to run {files.script} and showed 'Select Item To "
                          "Run' instead, so it cannot open that path.",
             "executor_wedged": False, **report}, indent=2)
+
+    # Still running: Stop and the recovery probe are window messages Altium
+    # is not reading, and each probe launch would only queue up behind it
+    if steps and await asyncio.to_thread(sandbox.altium_hung):
+        _mark_script_stuck("run_altium_script")
+        return json.dumps({
+            "success": False,
+            "error": f"no result after {timeout_seconds} s: the script is still running and "
+                     "Altium is not responding",
+            "last_step_reached": steps[-1],
+            "diagnosis": f"The script's while/repeat loops stop at {guard_seconds} s, so the time "
+                         "is going into a for loop or a single long Altium call. A running script "
+                         "cannot be stopped from outside. Wait for Altium; if it stays frozen, only "
+                         "ending X2.EXE frees it (unsaved work is lost). Do not retry until "
+                         "Altium responds.",
+            "steps": steps, "executor_wedged": True, **report}, indent=2)
 
     # No result and no error dialog. If our script started, it is ours: stop
     # it. If it never started, something else holds Altium - possibly a
@@ -1572,7 +1936,7 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
         "steps": steps, **report}, indent=2)
 
 
-@mcp.tool()
+@_tool()
 async def ensure_altium_script_skill(ctx: Context, install: bool = False) -> str:
     """
     Check whether the "altium-script" skill is installed, and optionally
@@ -1629,7 +1993,7 @@ async def ensure_altium_script_skill(ctx: Context, install: bool = False) -> str
                            "error": str(e)[:300]}, indent=2)
 
 
-@mcp.tool()
+@_tool(read_only=True)
 async def get_footprint_primitives(ctx: Context, library_path: str = "", footprint_name: str = "") -> str:
     """
     Read the primitives of footprints in a PCB library (.PcbLib).
@@ -1640,10 +2004,20 @@ async def get_footprint_primitives(ctx: Context, library_path: str = "", footpri
       component_bodies)
     - footprint_name given (exact, case-insensitive): full geometry dump -
       pads (position, rotation, layer, sizes/shape per stack, hole size/
-      type/width/rotation, plating), tracks, arcs, fills, texts, regions
-      (outline vertices). Coordinates in mils; shapes and hole types as raw
-      Altium enum ints; layers as names. 3D component bodies are models,
-      not 2D primitives, and are excluded.
+      type/width/rotation, plating, paste_mode/paste_expansion,
+      mask_mode/mask_expansion, locked), tracks, arcs, fills, texts,
+      regions (outline vertices). Coordinates in mils relative to the
+      footprint origin (also for the footprint shown in the editor, which
+      Altium holds offset by the library origin); shapes and hole types as
+      raw Altium enum ints; layers as names. 3D component bodies are listed
+      apart in bodies_3d, not among the primitives, so the
+      create_footprints_batch round-trip is unchanged: model_file,
+      model_embedded, model_x/model_y (offset from the footprint origin),
+      standoff_height and overall_height (mils), layer, and
+      rotation_x/y/z (degrees) and model_z_offset (mils). The rotations and
+      offset come from the saved library file (Altium's script API cannot
+      return them); "placement" says so, and they are null for a body that
+      is not saved yet.
     - footprint_name "*": full dump of every footprint
 
     Use as the reference when recreating or validating footprints, and to
@@ -1657,8 +2031,8 @@ async def get_footprint_primitives(ctx: Context, library_path: str = "", footpri
 
     Returns:
         str: JSON - inventory: {library_name, footprint_count, footprints:
-             [{name, description, <type counts>}]}; dump: primitives list
-             per footprint
+             [{name, description, <type counts>}]}; dump: primitives and
+             bodies_3d per footprint
     """
     logger.info(f"Getting footprint primitives (library={library_path}, footprint={footprint_name})")
 
@@ -1672,9 +2046,16 @@ async def get_footprint_primitives(ctx: Context, library_path: str = "", footpri
         return json.dumps({"success": False, "error": f"Failed to get footprint primitives: {error_msg}"})
 
     result = response.get("result", {})
-    return json.dumps(result, indent=2) if not isinstance(result, str) else result
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except ValueError:
+            return result
+    if isinstance(result, dict):
+        pcblib_file.add_body_placements(result)
+    return json.dumps(result, indent=2)
 
-@mcp.tool()
+@_tool()
 async def create_footprints_batch(ctx: Context, spec_file: str) -> str:
     """
     Create many PCB footprints in a single Altium script run.
@@ -1693,15 +2074,35 @@ async def create_footprints_batch(ctx: Context, spec_file: str) -> str:
             Altium enum ints, booleans as 1/0):
             FPLIB|<path to .PcbLib>   (optional first line: opens/focuses)
             FOOTPRINT|<name>|<description>
-            PAD|name|x|y|rot|layer|plated|hole_size|hole_type|hole_width|hole_rot|top_x|top_y|top_shape[|corner_pct[|mode|mid_x|mid_y|mid_shape|bot_x|bot_y|bot_shape]]
+            EDITFOOTPRINT|<name>      add MODEL3D records to an existing
+                                      footprint (never creates one; other
+                                      records under it are reported and
+                                      ignored)
+            PAD|name|x|y|rot|layer|plated|hole_size|hole_type|hole_width|hole_rot|top_x|top_y|top_shape[|corner_pct[|mode|mid_x|mid_y|mid_shape|bot_x|bot_y|bot_shape[|paste_mode|paste_expansion|mask_mode|mask_expansion]]]
+                Leave a field empty to skip it and still give a later one.
+                paste_mode/mask_mode are TMaskExpansionMode ints: 1 rule,
+                2 manual (with the expansion in mils). 0 (no mask) cannot
+                be set on a pad by script and is reported as a problem.
+                Omitted: rule. Every pad the tool creates is locked.
             TRACK|x1|y1|x2|y2|width|layer
             ARC|cx|cy|radius|start_angle|end_angle|width|layer
             FILL|x1|y1|x2|y2|rotation|layer
             TEXT|x|y|size|width|rotation|layer|mirror|ttf|text
             REGION|layer|kind|x1|y1|x2|y2|...
+            MODEL3D|<STEP file>|<layer>|<rot_x>|<rot_y>|<rot_z>|<z_offset>[|<x>|<y>[|<embed 1/0>]]
+                add a 3D body from a STEP file: rotations in degrees,
+                z_offset (model height above the board) and x|y (offset
+                from the footprint origin) in mils, embedded in the
+                library unless embed is 0. Read the result back with
+                get_footprint_primitives (bodies_3d); its rotations and
+                z offset appear only once the library is saved.
+
+    The library is left modified and unsaved; the user saves it.
 
     Returns:
-        str: JSON with created count, primitive_errors, failed names
+        str: JSON with created and edited counts, models_added,
+             primitive_errors, failed names and problems (e.g. a missing
+             model file, mask mode 0, a record EDITFOOTPRINT ignores)
     """
     logger.info(f"Creating footprints batch from {spec_file}")
 
@@ -1717,7 +2118,7 @@ async def create_footprints_batch(ctx: Context, spec_file: str) -> str:
     result = response.get("result", {})
     return json.dumps(result, indent=2) if not isinstance(result, str) else result
 
-@mcp.tool()
+@_tool()
 async def build_schematic(ctx: Context, parts: list, wires: list = None,
                           junctions: list = None, net_labels: list = None,
                           power_ports: list = None, notes: list = None) -> str:
@@ -1744,6 +2145,8 @@ async def build_schematic(ctx: Context, parts: list, wires: list = None,
       * A ground port's "GND" label is always drawn (ShowNetName cannot hide it)
         and occupies ~300 mil below the port. Keep wires out of that band.
 
+    Once the sheet is saved, run check_schematic on it and fix what it finds.
+
     Args:
         parts: component dicts. Required keys: designator, symbol_library
             (full path of a .SchLib file; .IntLib is not supported),
@@ -1760,11 +2163,22 @@ async def build_schematic(ctx: Context, parts: list, wires: list = None,
             sheet rather than guessing: 5 = digital ground, 2 = supply bar.
         notes: [{"x":..,"y":..,"text":".."}] free text.
 
+        All coordinates are mils and keep their fractions, so a metric sheet
+        can be drawn exactly (1 mm = 39.3700787 mil). The pin_map has the
+        same precision: route from its values unrounded, or a wire ends up
+        a few microns out of level and turns diagonal when its part moves.
+
     Returns:
         JSON with the created sheet name, counts, and the pin map - every
         placed pin's true connection point, for routing a follow-up call.
     """
     logger.info(f"Building schematic: {len(parts)} parts")
+
+    # The spec carries Altium coords (10000 per mil). Whole mils missed a
+    # metric grid by up to half a mil, and a wire that far out of level turns
+    # diagonal when its part is dragged.
+    def c(v):
+        return str(int(round(float(v) * 10000)))
 
     lines = []
     for p in parts:
@@ -1774,7 +2188,7 @@ async def build_schematic(ctx: Context, parts: list, wires: list = None,
                                    "error": f"part missing required key '{key}': {p}"})
         lines.append("PART|{}|{}|{}|{}|{}|{}|{}|{}".format(
             p["designator"], p["symbol_library"], p["symbol"],
-            p.get("design_item_id", ""), int(p["x"]), int(p["y"]),
+            p.get("design_item_id", ""), c(p["x"]), c(p["y"]),
             int(p.get("orientation", 0)), 1 if p.get("mirror") else 0))
         if p.get("comment"):
             lines.append(f"COMMENT|{p['comment']}")
@@ -1799,19 +2213,19 @@ async def build_schematic(ctx: Context, parts: list, wires: list = None,
         if len(route) < 4 or len(route) % 2:
             return json.dumps({"success": False,
                                "error": f"wire needs an even count of >=4 coords: {route}"})
-        lines.append("WIRE|" + "|".join(str(int(v)) for v in route))
+        lines.append("WIRE|" + "|".join(c(v) for v in route))
     for j in (junctions or []):
-        lines.append(f"JUNCTION|{int(j['x'])}|{int(j['y'])}")
+        lines.append(f"JUNCTION|{c(j['x'])}|{c(j['y'])}")
     for n in (net_labels or []):
         lines.append("NETLABEL|{}|{}|{}|{}".format(
-            int(n["x"]), int(n["y"]), int(n.get("orientation", 0)), n["text"]))
+            c(n["x"]), c(n["y"]), int(n.get("orientation", 0)), n["text"]))
     for pw in (power_ports or []):
         lines.append("POWER|{}|{}|{}|{}|{}|{}".format(
-            int(pw["x"]), int(pw["y"]), int(pw.get("orientation", 3)),
+            c(pw["x"]), c(pw["y"]), int(pw.get("orientation", 3)),
             int(pw.get("style", 5)), pw["text"],
             1 if pw.get("show_net_name") else 0))
     for nt in (notes or []):
-        lines.append(f"NOTE|{int(nt['x'])}|{int(nt['y'])}|{nt['text']}")
+        lines.append(f"NOTE|{c(nt['x'])}|{c(nt['y'])}|{nt['text']}")
 
     spec_path = Path("C:/Users/Public/altium_mcp/circuit_spec.txt")
     spec_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1837,14 +2251,15 @@ async def build_schematic(ctx: Context, parts: list, wires: list = None,
         for line in read_altium_text(pm).splitlines():
             f = line.strip().split("|")
             if len(f) == 5 and f[0] == "PIN":
-                pin_map.setdefault(f[1], {})[f[2]] = [int(f[3]), int(f[4])]
+                pin_map.setdefault(f[1], {})[f[2]] = [int(f[3]) / 10000, int(f[4]) / 10000]
     result["pin_map"] = pin_map
     result["pin_map_note"] = ("Absolute electrical connection points. Route "
                               "wires from these, not from predicted offsets.")
     return json.dumps(result, indent=2)
 
-@mcp.tool()
-async def edit_schematic(ctx: Context, sheet_path: str, operations: list) -> str:
+@_tool()
+async def edit_schematic(ctx: Context, sheet_path: str, operations: list,
+                         unit: str = "mil", save: bool = False) -> str:
     """Add, update or delete objects on an exact existing .SchDoc, in memory.
 
     Never saves documents. operations=[] reads the sheet's objects and UIDs.
@@ -1868,7 +2283,41 @@ async def edit_schematic(ctx: Context, sheet_path: str, operations: list) -> str
     including component pin electrical connection points for subsequent wiring.
     Moving a component does not reroute attached wires. Read
     dev/SCHEMATIC_CONVENTIONS.md before routing. Use fresh UIDs from this sheet.
+
+    Also accepts upstream action operations: move_component, delete_component,
+    place_component, set_parameter, move_text, add_wire, add_net_label,
+    add_power_port, add_junction, add_no_erc and delete_at. These use unit="mil"
+    or "mm" and optionally save=True. Do not mix the two operation formats.
+    UID add/update/delete operations always use mils and never save; use
+    save_document separately. Empty operations read objects in the UID format.
+
+    Action fields (brackets mean optional):
+      move_component: designator, [part], [x,y], [rotation 0/90/180/270], [mirror]
+      delete_component: designator, [part]
+      place_component: library (.SchLib path), symbol, designator, x, y,
+                       [rotation], [mirror], [comment]
+      set_parameter: designator, name, value, [part], [visible]
+      move_text: designator, name (Designator, Comment or a parameter), [part],
+                 [x,y], [justification 0..8], [orientation 0..3], [visible]
+      add_wire: points [[x,y], ...], with at least two points
+      add_net_label: x, y, text, [orientation 0..3], [justification 0..8]
+      add_power_port: x, y, text, [style: bar, arrow, circle, wave, power_ground,
+                      signal_ground, earth], [orientation 0..3], [show_net_name]
+      add_junction / add_no_erc: x, y
+      delete_at: kind (wire, net_label, power_port, junction, no_erc, port, note),
+                 x, y, [text]
+    part selects a multi-part component's part (1=A). Give x and y together.
+    Action operations run in order in one undo group; inspect errors for
+    partial failures. Moving components does not reroute their wires.
     """
+    if isinstance(operations, list) and any(
+        isinstance(op, dict) and isinstance(op.get("op"), str)
+        and op["op"] not in {"add", "update", "delete"} for op in operations
+    ):
+        return await _edit_schematic_actions(ctx, sheet_path, operations, unit, save)
+    if unit != "mil" or save is not False:
+        return json.dumps({"success": False, "saved": False, "applied_count": 0,
+                           "error": "UID operations require unit='mil' and save=False; use save_document separately"})
     try:
         spec = validate_schematic_edit(sheet_path, operations)
     except (ValueError, TypeError, OSError) as exc:
@@ -1891,7 +2340,7 @@ async def edit_schematic(ctx: Context, sheet_path: str, operations: list) -> str
             spec_path.unlink(missing_ok=True)
 
 
-@mcp.tool()
+@_tool()
 async def get_schematic_connectivity(ctx: Context, sheet_path: str, compiled: bool = True,
                                      expected_connections: Optional[list] = None) -> str:
     """Read pin numbers, electrical-end coordinates (mils) and actual compiler nets
@@ -1933,7 +2382,7 @@ async def get_schematic_connectivity(ctx: Context, sheet_path: str, compiled: bo
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 
-@mcp.tool()
+@_tool(read_only=True)
 async def get_lcsc_component_info(ctx: Context, query: str, qty: int = 1, limit: int = 5) -> str:
     """Read LCSC chip/component data by C-number, MPN or search text; no Altium needed.
 
@@ -1954,7 +2403,7 @@ async def get_lcsc_component_info(ctx: Context, query: str, qty: int = 1, limit:
         return json.dumps({"success": False, "error": str(exc), "saved": False}, ensure_ascii=False)
 
 
-@mcp.tool()
+@_tool()
 async def set_library_component_lcsc_data(ctx: Context, library_path: str, symbol_name: str,
                                          lcsc_id: str, qty: int = 1) -> str:
     """Fill LCSC/JLCPCB fields on an exact existing SchLib symbol after creation.
@@ -1985,7 +2434,7 @@ async def set_library_component_lcsc_data(ctx: Context, library_path: str, symbo
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 
-@mcp.tool()
+@_tool()
 async def set_library_component_data(ctx: Context, library_path: str, symbol_name: str,
                                      parameters: Optional[dict] = None, footprint_models: Optional[list] = None,
                                      comment: Optional[str] = None, description: Optional[str] = None) -> str:
@@ -2036,7 +2485,7 @@ async def set_library_component_data(ctx: Context, library_path: str, symbol_nam
             spec_path.unlink(missing_ok=True)
 
 
-@mcp.tool()
+@_tool()
 async def open_document(ctx: Context, document_path: str) -> str:
     """Open/focus an exact existing SchDoc/PcbDoc/SchLib/PcbLib by absolute path.
 
@@ -2052,7 +2501,7 @@ async def open_document(ctx: Context, document_path: str) -> str:
     return await document_management.execute(altium_bridge, EXCHANGE_DIR, "open_document", document_path)
 
 
-@mcp.tool()
+@_tool()
 async def create_document(ctx: Context, document_path: str, document_kind: Optional[str] = None) -> str:
     """Create a named unsaved document in Free Documents; never saves or adds it to a project.
 
@@ -2065,7 +2514,7 @@ async def create_document(ctx: Context, document_path: str, document_kind: Optio
                                              document_path, document_kind=document_kind)
 
 
-@mcp.tool()
+@_tool()
 async def save_document(ctx: Context, document_path: str, dry_run: bool = False) -> str:
     """Save ONLY the exact open SchDoc/PcbDoc/SchLib/PcbLib at its assigned local path.
 
@@ -2081,7 +2530,7 @@ async def save_document(ctx: Context, document_path: str, dry_run: bool = False)
                                              document_path, dry_run=dry_run)
 
 
-@mcp.tool()
+@_tool()
 async def add_document_to_project(ctx: Context, project_path: str, document_path: str) -> str:
     """Add one exact document to an exact OPEN .PrjPcb or .LibPkg, in memory only.
 
@@ -2095,10 +2544,185 @@ async def add_document_to_project(ctx: Context, project_path: str, document_path
                                              document_path, project_path=project_path)
 
 
-@mcp.tool()
+async def _edit_schematic_actions(ctx: Context, sheet_path: str, operations: list, unit: str = "mil",
+                         save: bool = False) -> str:
+    """
+    Change an existing schematic sheet: move, rotate, delete or place parts,
+    set parameters, move designators and parameter text, add wires, net
+    labels, power ports, junctions and no-ERC markers, and delete objects.
+
+    The whole edit is one undo step in Altium (Ctrl+Z takes it all back),
+    and the user's own edits stay undoable. Operations run in order; one
+    that fails is reported in "errors" and the rest still run.
+
+    Coordinates are absolute sheet coordinates, Altium's origin at the
+    bottom left, in `unit` ("mil" or "mm"). check_schematic reports
+    positions and suggestions in the sheet's own unit (mm for a metric
+    grid), so pass the same unit to apply its suggestions directly.
+
+    Operations, each a dict with "op":
+      move_component    designator, [part], [x, y], [rotation 0/90/180/270],
+                        [mirror true/false]. x, y is the part's origin.
+      delete_component  designator, [part]
+      place_component   library (.SchLib path), symbol, designator, x, y,
+                        [rotation], [mirror], [comment]
+      set_parameter     designator, name, value, [part], [visible]
+                        (creates the parameter when missing)
+      move_text         designator, name ("Designator", "Comment" or a
+                        parameter), [part], [x, y], [justification 0-8:
+                        bottom-left, bottom-centre, bottom-right, middle-left,
+                        ..., top-right], [orientation 0-3], [visible]
+      add_wire          points [[x, y], ...] (a pin's connection point is
+                        its outer end, as build_schematic's pin_map gives)
+      add_net_label     x, y (on a wire), text, [orientation], [justification]
+      add_power_port    x, y, text, [style: bar, arrow, circle, wave,
+                        power_ground, signal_ground, earth], [orientation
+                        0-3, default 1 = up], [show_net_name]
+      add_junction      x, y
+      add_no_erc        x, y
+      delete_at         kind (wire, net_label, power_port, junction, no_erc,
+                        port, note), x, y, [text]: removes a wire passing
+                        through the point, or the object located there
+    "part" picks one part of a multi-part component (1 = A, ...).
+
+    Args:
+        sheet_path (str): Full path of the .SchDoc; opened if not open.
+        operations (list): The operations above, applied in order.
+        unit (str): "mil" (default) or "mm".
+        save (bool): Save the sheet afterwards (needed before
+            check_schematic, which reads the saved file). Otherwise it is
+            left modified for the user to review and save.
+
+    Returns:
+        str: JSON with how many operations were applied and the errors.
+    """
+    import sch_edit
+
+    # Long paths, or Altium opens a second copy of a sheet or library that
+    # is already open
+    sheet_path = long_path(sheet_path)
+    operations = [dict(op, library=long_path(op["library"]))
+                  if isinstance(op, dict) and op.get("op") == "place_component" and op.get("library") else op
+                  for op in (operations or [])]
+    lines, error = sch_edit.encode_operations(operations, unit)
+    if error:
+        return json.dumps({"success": False, "error": error})
+    if not sheet_path.lower().endswith(".schdoc"):
+        return json.dumps({"success": False, "error": "sheet_path must be a .SchDoc"})
+    logger.info(f"Editing {sheet_path}: {len(lines)} operations")
+    # Unique input also isolates queued calls from other server processes.
+    spec_path = EXCHANGE_DIR / f"schematic_actions_{uuid.uuid4().hex}.txt"
+    write_altium_text(spec_path, "\n".join(lines) + "\n")
+    try:
+        response = await altium_bridge.execute_command("edit_schematic_actions", {
+            "sheet_path": sheet_path, "save": bool(save), "spec_file": str(spec_path)})
+        if not response.get("success", False):
+            return json.dumps({"success": False, "saved": False,
+                               "may_have_partial_changes": True, "spec_file": str(spec_path),
+                               "error": f"Failed to edit the sheet: {response.get('error', 'unknown error')}"})
+        result = response.get("result", {})
+        if isinstance(result, str):
+            result = json.loads(result)
+        if result.get("errors"):
+            result["success"] = False
+        return json.dumps(result, indent=2)
+    finally:
+        if 'response' in locals() and response.get("success", False):
+            spec_path.unlink(missing_ok=True)
+
+# Changes the design: a timeout leaves its outcome unknown, so no blind retry
+MUTATING_COMMANDS.add("edit_schematic")
+
+@_tool(read_only=True)
+async def check_schematic(ctx: Context, path: str, max_issues_per_sheet: int = 150) -> str:
+    """
+    Check a schematic sheet for drafting problems that make it hard to read.
+
+    Run it after drawing or editing a sheet (build_schematic, run_altium_script
+    or by hand), fix what it reports, and run it again. It reads the SAVED
+    file and does not need Altium, so save the sheet first; unsaved edits are
+    not seen.
+
+    Issue types, most important first:
+      * pin_tap - a two-pin part (decoupling cap, pull-up) joins its net AT its
+        own pin. Move the part so a short wire (a couple of grids) runs from
+        the pin to a junction on the net; suggest.junction_at shows where.
+      * label_not_at_end - a net label sits along a wire, away from the wire's
+        free end. Put it at the end (suggest gives the point).
+      * label_justification - a label at the free end whose text hangs off
+        the end of the wire. Justify it so the text runs back along the wire:
+        bottom-right (2) when the wire ends to the right, bottom-left (0)
+        when it ends to the left. A middle-justified (3/5) label anchored on
+        the end, reading outward like a port, is also accepted.
+      * sheet_entry_margin - a sheet symbol's first entry sits well below its
+        top edge. Altium's default is one grid (100 mil; 3 mm on a 1 mm grid);
+        extra room at the bottom is fine.
+      * sheet_symbol_text - a sheet symbol's designator or file name is not
+        above it. Both go above: file name on the top edge, designator a line
+        (100 mil) above it, both bottom-left justified at the left edge.
+      * label_orientation, label_off_wire, dangling_wire, wire_through_body.
+      * slanted_wire - a wire segment a little (1 um to half a grid) out of
+        level or plumb. It looks straight, but dragging a part on it turns it
+        diagonal. Usually a symbol whose pins are off the grid (then the
+        issue names the pin) or coordinates rounded to whole mils.
+        suggest.move_end/to give the end to move, at full precision:
+        delete_at the wire and add_wire it again with the new end.
+      * text_overlap - a designator, parameter, net label or port text
+        overlapping a wire, a pin, a part or other text. For part text the
+        issue carries suggest.texts: positions (x, y, justification) for the
+        designator and each visible parameter that collide with nothing, e.g.
+        designator left and value right of a vertical cap.
+
+    Coordinates are in the sheet's units ("unit": mm for a metric grid,
+    otherwise mil) with Altium's origin at the bottom left.
+
+    Args:
+        path: a .SchDoc, a .PrjPcb (every sheet it lists), or a folder (every
+            .SchDoc in it, not recursive).
+        max_issues_per_sheet: cap on issues listed per sheet; counts are
+            always complete.
+
+    Returns:
+        JSON: per sheet, the issue counts and the issues.
+    """
+    import schematic_check
+
+    p = Path(path)
+    if p.is_dir():
+        sheets = sorted(p.glob("*.SchDoc"))
+    elif p.suffix.lower() == ".prjpcb" and p.is_file():
+        sheets = schematic_check.project_sheets(p)
+    elif p.suffix.lower() == ".schdoc" and p.is_file():
+        sheets = [p]
+    else:
+        return json.dumps({"success": False,
+                           "error": f"not a .SchDoc, .PrjPcb or folder: {path}"})
+
+    results, totals = [], {}
+    for sheet in sheets:
+        if not Path(sheet).is_file():
+            results.append({"sheet": str(sheet),
+                            "error": "listed in the project but not on disk - save it in Altium first"})
+            continue
+        try:
+            r = schematic_check.check_sheet(sheet)
+        except Exception as e:
+            results.append({"sheet": str(sheet), "error": f"{type(e).__name__}: {e}"})
+            continue
+        for k, v in r["issue_counts"].items():
+            totals[k] = totals.get(k, 0) + v
+        if len(r["issues"]) > max_issues_per_sheet:
+            r["issues"] = r["issues"][:max_issues_per_sheet]
+            r["truncated"] = True
+        results.append(r)
+    return json.dumps({"success": True, "sheets": len(sheets), "issue_counts": totals,
+                       "results": results}, indent=1)
+
+@_tool()
 async def create_symbols_batch(ctx: Context, spec_file: str) -> str:
     """
-    Create many schematic symbols in a single Altium script run.
+    Create many schematic symbols, or edit existing ones, in a single
+    Altium script run.
 
     Use instead of repeated create_schematic_symbol calls when creating
     more than a handful of symbols (bulk library imports/migrations): one
@@ -2116,16 +2740,60 @@ async def create_symbols_batch(ctx: Context, spec_file: str) -> str:
             PARAM|<name>|<value>   (required metadata for each SYMBOL)
             PIN|<same pipe fields as create_schematic_symbol pins>
             GRAPHIC|<same entry format as create_schematic_symbol graphics>
-            Each SYMBOL line starts a new symbol; PIN/GRAPHIC lines belong
-            to the most recent SYMBOL.
-            Every symbol requires Value, MF, MP, HelpURL, Package, Type,
+            Every new symbol requires Value, MF, MP, HelpURL, Package, Type,
             Instructions and System with actual nonempty string values, plus
             a searchable description (category, function/specifications, package).
             Use Package; Pacage is rejected. All blocks are checked before edits.
             Values after PARAM's second | are preserved, including additional |.
+            SYMPARAM can also provide creation metadata. Existing-symbol edit
+            blocks do not require the creation schema.
+            EDITSYMBOL|<name>   edit an existing symbol instead (its pins
+                                and graphics are left alone; a missing
+                                symbol is reported as failed, never created)
+            COMMENT|<text>[|<visible 1/0>]   set the Comment (empty text
+                                is allowed); hidden unless visible is 1
+            DESCRIPTION|<text>  set the Description
+            SYMPARAM|<name>|<value>|<visible 1/0>[|x|y[|justification[|font]]]
+                                add a symbol parameter, or replace one with
+                                that name. By default, visible ones without
+                                x|y go below the body's bottom-left corner,
+                                left-aligned, 100 mil apart in record order
+                                (leave a field empty to skip it and still
+                                give a later one). justification:
+                                bottom_left, bottom_center, bottom_right,
+                                center_left, center, center_right, top_left,
+                                top_center or top_right. font: <font
+                                name>:<size>, e.g. "Arial:10" (resolved by
+                                name, so it works in any document). Omitted
+                                fields keep the parameter's own. A parameter
+                                the tool positions gets Autoposition off, so
+                                Altium does not move it later.
+            PINPARAM|<pin number>|<name>|<value>   add (or replace) a hidden
+                                parameter on every pin with that number
+            PINDESC|<pin number>|<text>   set the Description of every pin
+                                with that number
+            PINSYMBOL|<pin number>|<edge>|<symbol>   set an IEEE symbol of
+                                every pin with that number. edge: inside,
+                                inside_edge, outside_edge or outside.
+                                symbol: a TIeeeSymbol name without the
+                                leading "e", any case - none, dot, clock,
+                                activelowinput, activelowoutput, schmitt,
+                                analogsignalin, digitalsignalin, opencollector,
+                                hiz, ... (the full list is in the
+                                altium-script skill, SCH_API_Reference.md,
+                                TIeeeSymbol). An unknown edge or symbol is
+                                reported under problems.
+            These records work after SYMBOL and EDITSYMBOL alike.
+            Each SYMBOL or EDITSYMBOL line starts a new symbol; the other
+            records belong to the most recent one.
+
+    Every created or edited symbol is one undo step and marks the library
+    as modified; nothing is saved - the user saves the library.
 
     Returns:
-        str: JSON object with created count and a failed name list
+        str: JSON object with created and edited counts, a failed name list
+             and problems (e.g. a pin number not in the symbol, an unknown
+             IEEE symbol or justification)
     """
     try:
         text, symbols = symbol_metadata.prepare_batch(spec_file)
@@ -2143,7 +2811,15 @@ async def create_symbols_batch(ctx: Context, spec_file: str) -> str:
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
         logger.error(f"Error in batch symbol creation: {error_msg}")
-        return json.dumps({"success": False, "error": f"Failed batch creation: {error_msg}",
+        details = response.get("result", {})
+        if isinstance(details, str):
+            try:
+                details = json.loads(details)
+            except ValueError:
+                details = {}
+        if not isinstance(details, dict):
+            details = {}
+        return json.dumps({**details, "success": False, "error": f"Failed batch creation: {error_msg}",
                            "saved": False, "may_have_partial_changes": True, "spec_file": str(prepared_file)})
 
     result = response.get("result", {})
@@ -2156,14 +2832,14 @@ async def create_symbols_batch(ctx: Context, spec_file: str) -> str:
     for item, request in zip(results, symbols):
         if item.get("component_name") != request["symbol_name"]:
             errors.append("created-symbol order/name mismatch")
-        symbol_metadata.verify(item, request["description"], request["parameters"])
+        symbol_metadata.verify(item, request["description"], request["parameters"], request.get("comment"))
         errors.extend(item["verification"]["errors"])
     result["verification"] = {"passed": not errors, "errors": errors}
-    result["success"] = not errors and not result.get("failed") and result.get("created") == len(symbols)
+    result["success"] = not errors and not result.get("failed") and not result.get("problems") and result.get("created") == len(symbols)
     result["may_have_partial_changes"] = not result["success"] and bool(result.get("created"))
     return json.dumps(result, indent=2)
 
-@mcp.tool()
+@_tool(read_only=True)
 async def get_symbol_primitives(ctx: Context, library_path: str = "", symbol_name: str = "") -> str:
     """
     Read the graphic primitives of symbols in a schematic library (.SchLib).
@@ -2188,7 +2864,14 @@ async def get_symbol_primitives(ctx: Context, library_path: str = "", symbol_nam
         str: JSON object - inventory mode: {library_name, symbol_count,
              symbols: [{name, description, part_count, <type counts>}]};
              dump mode: {library_name, symbol_name, description, part_count,
-             primitives: [...]}
+             comment: {text, visible}, parameters: [{name, value, visible,
+             x, y, justification, autoposition, font: {name, size}}],
+             primitives: [...]} - x and y are where Altium holds the
+             parameter now. Pins also carry
+             description, symbol_inside, symbol_inside_edge,
+             symbol_outside_edge and symbol_outside (IEEE symbol names as
+             PINSYMBOL takes them), and their parameters [{name, value}]
+             when they have any
     """
     logger.info(f"Getting symbol primitives (library={library_path}, symbol={symbol_name})")
 
@@ -2205,7 +2888,7 @@ async def get_symbol_primitives(ctx: Context, library_path: str = "", symbol_nam
     result = response.get("result", {})
     return json.dumps(result, indent=2) if not isinstance(result, str) else result
 
-@mcp.tool()
+@_tool(read_only=True)
 async def get_all_nets(ctx: Context) -> str:
     """
     Return every unique net name in the active PCB document.
@@ -2227,7 +2910,7 @@ async def get_all_nets(ctx: Context) -> str:
     # Result is already a JSON‑serialisable Python list
     return json.dumps(response.get("result", []), indent=2)
 
-@mcp.tool()
+@_tool()
 async def create_net_class(ctx: Context, class_name: str, net_names: list) -> str:
     """
     Create a new net class and add specified nets to it
@@ -2237,7 +2920,9 @@ async def create_net_class(ctx: Context, class_name: str, net_names: list) -> st
         net_names (list): List of net names to add to the class
     
     Returns:
-        str: JSON object with the result of the operation
+        str: JSON object with the result of the operation. nets_added counts
+        the nets that were not in the class before; names the board has no
+        net for are listed in nets_not_found and not added.
     """
     logger.info(f"Creating net class '{class_name}' with {len(net_names)} nets")
     
@@ -2262,7 +2947,7 @@ async def create_net_class(ctx: Context, class_name: str, net_names: list) -> st
     logger.info(f"Net class '{class_name}' created/modified successfully")
     return json.dumps(result, indent=2)
     
-@mcp.tool()
+@_tool()
 async def set_component_position(ctx: Context, cmp_designator: str, x: float, y: float, rotation: float = -1) -> str:
     """
     Set a component's absolute position in the PCB layout
@@ -2297,7 +2982,7 @@ async def set_component_position(ctx: Context, cmp_designator: str, x: float, y:
     logger.info(f"Component position set successfully")
     return json.dumps({"success": True, "result": result}, indent=2)
 
-@mcp.tool()
+@_tool()
 async def move_components(ctx: Context, cmp_designators: list, x_offset: float, y_offset: float, rotation: float = 0) -> str:
     """
     Move components by RELATIVE offset from their current position (not absolute positioning)
@@ -2339,7 +3024,7 @@ async def move_components(ctx: Context, cmp_designators: list, x_offset: float, 
     logger.info(f"Components moved successfully")
     return json.dumps({"success": True, "result": result}, indent=2)
 
-@mcp.tool()
+@_tool()
 async def place_components(ctx: Context, placements: list) -> str:
     """
     Place multiple components at absolute positions in a single Altium transaction.
@@ -2447,7 +3132,7 @@ def _mst_length(points: list) -> float:
                     best[v] = d
     return total
 
-@mcp.tool()
+@_tool(read_only=True)
 async def get_net_connections(ctx: Context, cmp_designators: list = None, max_pads_per_net: int = 40) -> str:
     """
     Get net connectivity and airline (unrouted connection) lengths for the
@@ -2531,7 +3216,7 @@ def _rotate_offset(dx: float, dy: float, degrees: float) -> tuple:
     return (dx * math.cos(rad) - dy * math.sin(rad),
             dx * math.sin(rad) + dy * math.cos(rad))
 
-@mcp.tool()
+@_tool(read_only=True)
 async def check_orientation(ctx: Context, cmp_designators: list = None, min_improvement_mils: float = 25) -> str:
     """
     Advisory check: find 2-pad passives whose rotation could be improved.
@@ -2672,7 +3357,7 @@ async def check_orientation(ctx: Context, cmp_designators: list = None, min_impr
         "suggestions": suggestions,
     }, indent=2)
 
-@mcp.tool()
+@_tool(read_only=True)
 async def check_placement(ctx: Context, cmp_designators: list = None, clearance_mils: float = 6) -> str:
     """
     Verify component placement: find overlaps and clearance violations.
@@ -2717,10 +3402,1249 @@ async def check_placement(ctx: Context, cmp_designators: list = None, clearance_
     logger.info(f"Placement check complete: {result.get('violation_count', '?')} violations")
     return json.dumps(result, indent=2)
 
-@mcp.tool()
+@_tool(read_only=True)
+async def check_routing(ctx: Context, nets: list = None, angle_tolerance_deg: float = 0.1,
+                        max_findings: int = 50) -> str:
+    """
+    Check the routed copper of the focused PCB for segments that are not 0,
+    45 or 90 degrees, and for right-angle and acute corners.
+
+    Run this after changing tracks or vias - a screenshot does not show a
+    stub that is 2 degrees off 45. Such stubs come from a diagonal whose end
+    was snapped to a grid on its own, or from a track end dragged along
+    when a via or component moved. Only tracks with a net that are not part
+    of a component or polygon pour count. A corner is where exactly two
+    track ends of one net meet on one layer; under a via or pad it is not
+    a corner.
+
+    Args:
+        nets (list, optional): Check only these nets (exact names, any case).
+        angle_tolerance_deg (float): How far a segment may be from a
+            multiple of 45 degrees (default 0.1).
+        max_findings (int): Most entries listed per kind (default 50). The
+            counts always cover every segment.
+
+    Returns:
+        str: JSON with clean (true when nothing was found), the segment
+             count, segment_angles (orthogonal / 45 / off-angle counts),
+             corner_turns (straight / 45 / 90 / acute counts), and the
+             off_angle segments and sharp_corners: net, layer, positions in
+             mils relative to the board origin, angle or turn in degrees.
+    """
+    logger.info(f"Checking routing (nets={nets}, tolerance={angle_tolerance_deg})")
+
+    response = await altium_bridge.execute_command("get_routing_geometry", {})
+    if not response.get("success", False):
+        error_msg = response.get("error", "Unknown error")
+        logger.error(f"Error reading routing: {error_msg}")
+        return json.dumps({"success": False, "error": f"Failed to read the routing: {error_msg}"})
+
+    geo = routing.parse_geometry(str(response.get("result", "")))
+    report = routing.check(geo, angle_tolerance_deg, nets)
+    report["clean"] = not report["off_angle"] and not report["sharp_corners"]
+    report["routed_arcs"] = len(geo["arcs"])
+    for key in ("off_angle", "sharp_corners"):
+        report[f"{key}_count"] = len(report[key])
+        report[key] = report[key][:max(0, max_findings)]
+    logger.info(f"Routing check: {report['off_angle_count']} off-angle, "
+                f"{report['sharp_corners_count']} sharp corners in {report['segments']} segments")
+    return json.dumps(report, indent=2)
+
+@_tool()
+async def place_polygon_pour(ctx: Context, outline: list, layer: str, net: str = "", name: str = "",
+                             hatch: str = "solid", pour_over_same_net: bool = True,
+                             remove_dead_copper: bool = True, track_width_mils: float = 0,
+                             grid_mils: float = 0, board_path: str = "") -> str:
+    """
+    Add a polygon pour (copper area, e.g. a ground pour) to a PCB and pour it.
+
+    The pour keeps the board's clearance rules from other nets and joins
+    same-net pads and tracks as the polygon connect rule says. Cut holes in
+    it with place_cutout.
+
+    Args:
+        outline (list): Corners [[x, y], ...] in mils relative to the board
+            origin, in order around the shape (at least three; it closes by
+            itself). Straight edges only.
+        layer (str): Signal layer, by its stack name or Altium's name, e.g.
+            "Top Layer".
+        net (str): Net to pour; it must exist on the board. Empty for an
+            unconnected pour.
+        name (str): Polygon name; empty lets Altium name it.
+        hatch (str): "solid" (default), "hatched_45", "hatched_90", or
+            "none" (outline only).
+        pour_over_same_net (bool): Pour over same-net tracks and pads.
+        remove_dead_copper (bool): Remove islands not connected to the net.
+        track_width_mils (float): Hatch track width; 0 for Altium's default.
+        grid_mils (float): Hatch grid; 0 for Altium's default.
+        board_path (str): Full path of the .PcbDoc; empty for the focused
+            board, or the one the PCB tools last used.
+
+    Returns:
+        str: JSON with the polygon's name, layer, net and what it poured:
+             poured_regions, one per separate piece of solid copper, and
+             hatch_tracks for a hatched pour. When nothing was poured it
+             says why it may be: no room, or every piece touched nothing on
+             its net and was removed as dead copper.
+    """
+    import pcb_shapes
+
+    board_path = long_path(board_path)
+    points, error = pcb_shapes.outline_points(outline)
+    if error:
+        return json.dumps({"success": False, "error": error})
+    if hatch not in ("solid", "hatched_45", "hatched_90", "none"):
+        return json.dumps({"success": False, "error": "hatch is solid, hatched_45, hatched_90 or none"})
+    if track_width_mils < 0 or grid_mils < 0:
+        return json.dumps({"success": False, "error": "track_width_mils and grid_mils cannot be negative"})
+    logger.info(f"Placing a polygon pour on {layer} ({net or 'no net'})")
+    response = await altium_bridge.execute_command("create_polygon_pour", {
+        "outline": pcb_shapes.encode(points), "layer": layer, "net": net, "name": name,
+        "hatch": hatch, "pour_over_same_net": "true" if pour_over_same_net else "false",
+        "remove_dead_copper": "true" if remove_dead_copper else "false",
+        "track_size": int(round(track_width_mils * pcb_shapes.COORD_PER_MIL)),
+        "grid": int(round(grid_mils * pcb_shapes.COORD_PER_MIL)), "board_path": board_path})
+    if not response.get("success", False):
+        return json.dumps({"success": False,
+                           "error": f"Failed to add the polygon: {response.get('error', 'unknown error')}"})
+    result = response.get("result", {})
+    if isinstance(result, str):
+        return result
+    if hatch != "none" and not result.get("poured_regions") and not result.get("hatch_tracks"):
+        result["warning"] = ("Nothing was poured: there is no room inside the outline, or every piece "
+                             "touched nothing on its net and was removed as dead copper "
+                             "(remove_dead_copper).")
+    return json.dumps(result, indent=2)
+
+@_tool()
+async def place_cutout(ctx: Context, outline: list, kind: str = "polygon", layer: str = "",
+                       board_path: str = "") -> str:
+    """
+    Add a cutout to a PCB: a hole in polygon pours, or in the board itself.
+
+    kind "polygon" keeps polygon pours out of the area on one signal layer
+    (or on every signal layer with layer "all"), as Altium's Polygon Pour
+    Cutout does. kind "board" cuts the area out of the board (a slot or
+    opening). Either way the polygons the cutout overlaps are repoured.
+
+    Args:
+        outline (list): Corners [[x, y], ...] in mils relative to the board
+            origin, in order around the shape (at least three).
+        kind (str): "polygon" (default) or "board".
+        layer (str): For a polygon cutout, the signal layer ("Top Layer",
+            a stack name) or "all". Ignored for a board cutout.
+        board_path (str): Full path of the .PcbDoc; empty for the focused
+            board, or the one the PCB tools last used.
+
+    Returns:
+        str: JSON with how many cutout regions were added and how many
+             polygons were repoured.
+    """
+    import pcb_shapes
+
+    board_path = long_path(board_path)
+    points, error = pcb_shapes.outline_points(outline)
+    if error:
+        return json.dumps({"success": False, "error": error})
+    if kind not in ("polygon", "board"):
+        return json.dumps({"success": False, "error": "kind is polygon or board"})
+    if kind == "polygon" and not layer.strip():
+        return json.dumps({"success": False, "error": "a polygon cutout needs a layer, or \"all\""})
+    logger.info(f"Placing a {kind} cutout")
+    response = await altium_bridge.execute_command("create_cutout", {
+        "outline": pcb_shapes.encode(points), "kind": kind, "layer": layer, "board_path": board_path})
+    if not response.get("success", False):
+        return json.dumps({"success": False,
+                           "error": f"Failed to add the cutout: {response.get('error', 'unknown error')}"})
+    result = response.get("result", {})
+    return json.dumps(result, indent=2) if not isinstance(result, str) else result
+
+# Change the design: a timeout leaves their outcome unknown, so no blind retry
+MUTATING_COMMANDS.update({"create_polygon_pour", "create_cutout"})
+
+@_tool()
+async def route_track(ctx: Context, net_name: str, layer: str, width_mils: float, points: list,
+                      diagonal_first: bool = False, corner_chamfer_mils: float = 0,
+                      dry_run: bool = False) -> str:
+    """
+    Add a routed track through waypoints on the focused PCB, every segment
+    exactly 0, 45 or 90 degrees.
+
+    Between two waypoints that are not in line, the track takes a straight
+    leg and a 45 degree diagonal. The diagonal is computed from its own
+    start point, so its x and y runs are equal: nothing is snapped on its
+    own, which is what leaves stubs a few degrees off 45. Use this instead
+    of placing track segments from run_altium_script, and run
+    check_routing afterwards. It adds tracks only: no vias, and no DRC.
+
+    Args:
+        net_name (str): Net of the track; it must exist on the board.
+        layer (str): Layer name as get_component_pins and check_routing
+            report it, e.g. "Top Layer" or "Bottom Layer".
+        width_mils (float): Track width in mils.
+        points (list): Waypoints [[x, y], ...] in mils relative to the
+            board origin, at least two: usually a pad centre, any bends,
+            and the far pad or via centre.
+        diagonal_first (bool): Put the diagonal at the start of each
+            stretch instead of its end (default: straight, then diagonal).
+        corner_chamfer_mils (float): Cut each right-angle corner between two
+            straight legs with a 45 degree segment, setting back this far on
+            each leg (at most half the shorter leg). 0 leaves them square.
+        dry_run (bool): Only compute and return the segments.
+
+    Returns:
+        str: JSON with the segments in mils ([x1, y1, x2, y2]) and, unless
+             dry_run, how many tracks were added.
+    """
+    logger.info(f"Routing {net_name} on {layer} through {len(points or [])} points")
+
+    def coord(v):
+        return int(round(float(v) * routing.COORD_PER_MIL))
+
+    try:
+        waypoints = [(coord(p[0]), coord(p[1])) for p in points]
+    except (TypeError, ValueError, IndexError):
+        return json.dumps({"success": False, "error": "points must be a list of [x, y] pairs in mils"})
+    if len(waypoints) < 2:
+        return json.dumps({"success": False, "error": "points needs at least two waypoints"})
+    if width_mils <= 0:
+        return json.dumps({"success": False, "error": "width_mils must be positive"})
+
+    segments = routing.route(waypoints, diagonal_first, coord(corner_chamfer_mils))
+    if not segments:
+        return json.dumps({"success": False, "error": "the waypoints are all the same point"})
+    result = {"segments_mils": [[routing.to_mils(v) for v in s] for s in segments]}
+    if dry_run:
+        return json.dumps({"success": True, "dry_run": True, **result}, indent=2)
+
+    response = await altium_bridge.execute_command("create_route_tracks", {
+        "net_name": net_name,
+        "layer": layer,
+        "width": coord(width_mils),
+        "segments": ";".join("|".join(str(v) for v in s) for s in segments),
+    })
+    if not response.get("success", False):
+        error_msg = response.get("error", "Unknown error")
+        logger.error(f"Error routing track: {error_msg}")
+        return json.dumps({"success": False, "error": f"Failed to add the track: {error_msg}", **result})
+
+    created = response.get("result", {})
+    if isinstance(created, dict):
+        result.update({k: v for k, v in created.items() if k != "success"})
+    return json.dumps({"success": True, **result}, indent=2)
+
+
+# Board snapshot for the silkscreen tools. An export takes a few seconds, so
+# views and option queries reuse it. Moves made through
+# set_designator_positions are written into it, check_silkscreen always
+# refreshes it, and it is re-exported once older than SILK_SNAPSHOT_SECONDS.
+# Edits made by hand in Altium are seen after that, or with refresh=True.
+SILK_SNAPSHOT_SECONDS = 900
+_silk_snapshot = {"board": None, "time": 0.0}
+
+async def _silk_board(refresh: bool = False):
+    """The board's silkscreen geometry, exported from Altium when needed."""
+    snap = _silk_snapshot
+    if refresh or snap["board"] is None or time.time() - snap["time"] > SILK_SNAPSHOT_SECONDS:
+        response = await altium_bridge.execute_command("export_silkscreen_data", {})
+        if not response.get("success", False):
+            raise RuntimeError(response.get("error", "Unknown error"))
+        result = response.get("result", {})
+        if isinstance(result, str):
+            result = json.loads(result)
+        text = read_altium_text(result["file"])
+        snap["board"], snap["time"] = silkscreen.Board(text), time.time()
+    return snap["board"]
+
+async def _check_silk_drc(designators: list = None) -> dict:
+    params = {"designators": designators} if designators else {}
+    response = await altium_bridge.execute_command("check_silkscreen", params)
+    if not response.get("success", False):
+        raise RuntimeError(response.get("error", "Unknown error"))
+    result = response.get("result", {})
+    return json.loads(result) if isinstance(result, str) else result
+
+def _group_silk_violations(drc: dict) -> dict:
+    """Altium's per-object silk violations as {designator: [description]}."""
+    grouped = {}
+    for v in drc.get("violations", []):
+        what = v.get("object", "")
+        if v.get("owner"):
+            what += f" {v['owner']}" + (f"-{v['detail']}" if v.get("object") == "Pad" and v.get("detail") else "")
+        elif v.get("detail"):
+            what += f" '{v['detail']}'"
+        if "distance_mils" in v:
+            what += f" ({v['distance_mils']} mil)"
+        grouped.setdefault(v["designator"], []).append(f"{v['rule']}: {what}")
+    return dict(sorted(grouped.items()))
+
+def _silk_side(side, designators, board) -> str:
+    """'T' or 'B' from a side argument, else from the first designator."""
+    if side:
+        s = str(side).strip().lower()
+        if s in ("top", "t"):
+            return "T"
+        if s in ("bottom", "b", "bot"):
+            return "B"
+        raise ValueError("side must be 'top' or 'bottom'")
+    for d in designators or ():
+        c = board.components.get(d)
+        if c is not None and c.side in ("T", "B"):
+            return c.side
+    return "T"
+
+def _current_boxes(board, side=None) -> dict:
+    return {d: (c.text_box, c.text_rotation) for d, c in board.components.items()
+            if c.visible and c.side in ("T", "B") and (side is None or c.side == side)}
+
+def _focus_around(board, designators, side, min_size=300.0):
+    """Area showing the parts, their current labels, and some surroundings."""
+    bb = silkscreen.focus_box(board, designators, side)
+    if bb is None:
+        return None
+    for d in designators:
+        c = board.components.get(d)
+        if c is not None and c.side == side and c.visible:
+            bb = silkscreen._union(bb, c.text_box)
+    cx, cy = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+    hw, hh = max((bb[2] - bb[0]) / 2, min_size / 2), max((bb[3] - bb[1]) / 2, min_size / 2)
+    return (cx - hw, cy - hh, cx + hw, cy + hh)
+
+def _box_info(rect, rotation) -> dict:
+    return {"x": round((rect[0] + rect[2]) / 2, 2), "y": round((rect[1] + rect[3]) / 2, 2),
+            "rotation": round(rotation) % 360,
+            "width": round(rect[2] - rect[0], 1), "height": round(rect[3] - rect[1], 1)}
+
+SILK_VIEW_LEGEND = ("grid lines labelled in mils (board origin); copper = solder mask openings "
+                    "(dark = vias); white = silk; grey names = part centres; yellow = designators; "
+                    "red = designators with problems; cyan = the designators asked about, with a line "
+                    "to their part; green numbered = options")
+
+AUTOPLACE_POSITIONS = ["TopCenter", "CenterRight", "BottomCenter", "CenterLeft",
+                       "TopLeft", "TopRight", "BottomLeft", "BottomRight"]
+AUTOPLACE_ROTATIONS = {"component": 0, "horizontal": 1, "along_side": 2,
+                       "along_axis": 3, "along_pins": 4, "klc": 5}
+# The script's GUI defaults, used when there is no saved settings file
+AUTOPLACE_DEFAULTS = {
+    "failed_action": "center", "avoid_vias": True, "rotation_strategy": 5,
+    "try_altered_rotation": True, "second_pass": True, "unhide_all": False,
+    "auto_hide": [], "text_height_mils": 31.496, "stroke_width_mils": 5.906,
+    "position_delta_mils": 16.535, "positions": AUTOPLACE_POSITIONS[:4],
+}
+
+def _to_mils(text: str):
+    """'30mil', '0.8mm', '0.05in' or a bare number (mils) -> mils."""
+    m = re.match(r"\s*([-+]?\d*\.?\d+)\s*(mil|mm|in)?\s*$", str(text), re.I)
+    if not m:
+        return None
+    value, unit = float(m.group(1)), (m.group(2) or "mil").lower()
+    return value * {"mil": 1.0, "mm": 1000 / 25.4, "in": 1000.0}[unit]
+
+def _saved_autoplacer_settings() -> dict:
+    """Options saved by the AutoPlaceSilkscreen GUI (AutoPlaceSilkscreen.ini in
+    Altium's application data folder), in this tool's terms. Empty if none."""
+    import configparser
+    files = glob.glob(os.path.join(os.environ.get("APPDATA", ""), "Altium", "*", "AutoPlaceSilkscreen.ini"))
+    if not files:
+        return {}
+    ini = configparser.ConfigParser()
+    try:
+        ini.read(max(files, key=os.path.getmtime))
+        g = ini["General"]
+    except (configparser.Error, KeyError):
+        return {}
+    flag = lambda key, default: g.get(key, "1" if default else "0").strip() in ("1", "true", "True")
+    out = {
+        "failed_action": {"0": "center", "1": "hide", "2": "restore"}.get(g.get("FailedPlacementOptions", "0"), "center"),
+        "avoid_vias": flag("AvoidVias", True),
+        "rotation_strategy": int(g.get("RotationStrategy", "5")),
+        "try_altered_rotation": flag("TryAlteredRotation", True),
+        "second_pass": flag("WiggleEnabled", True),
+        "unhide_all": flag("UnhideAllDesignators", False),
+        "auto_hide": [x.strip() for x in g.get("AutoHideList", "").split(",") if x.strip()]
+                     if flag("AutoHideEnabled", False) else [],
+        "text_height_mils": (_to_mils(g.get("FixedSize", "")) or 0) if flag("FixedSizeEnabled", True) else 0,
+        "stroke_width_mils": (_to_mils(g.get("FixedWidth", "")) or 0) if flag("FixedWidthEnabled", True) else 0,
+        "position_delta_mils": _to_mils(g.get("PositionDelta", "")) or AUTOPLACE_DEFAULTS["position_delta_mils"],
+        "positions": [p for i, p in enumerate(AUTOPLACE_POSITIONS, 1) if flag(f"Position{i}", i <= 4)],
+    }
+    return out
+
+@_tool()
+async def auto_place_silkscreen(ctx: Context, designators: list = None, selected_only: bool = False,
+                                failed_action: str = None, avoid_vias: bool = None,
+                                rotation_strategy: str = None, positions: list = None,
+                                try_altered_rotation: bool = None, second_pass: bool = None,
+                                unhide_all: bool = None, auto_hide: list = None,
+                                allow_under: list = None, text_height_mils: float = None,
+                                stroke_width_mils: float = None, position_delta_mils: float = None,
+                                component_outline_layer: str = None,
+                                use_saved_settings: bool = True) -> str:
+    """
+    Bulk-place designators with the Silkscreen Auto Placer script - step 1 of
+    silkscreen cleanup. Then finish by hand with the other silkscreen tools.
+
+    Runs a headless port of the AutoPlaceSilkscreen script inside Altium. For
+    every part, smallest first, it tries the enabled autopositions on an
+    offset grid with shrinking text, then a retry pass (rotation flip, wider
+    grid) and a 2nd-pass "wiggle" search up to 100 mil out. It avoids pads,
+    component bodies, other silk and (optionally) vias, and keeps the Board
+    Outline Clearance rule's distance from the board edge. Typically 80-95%
+    of designators end up placed; the rest are handled per failed_action.
+    Everything is one undo step. A whole-board run moves every designator:
+    ask the user to save the board first.
+
+    It is fast and good at the bulk, but it does not judge readability:
+    labels can land far from their part (2nd-pass label blocks), next to a
+    neighbour, or over open vias when avoid_vias is off. Always follow up:
+    1. check_silkscreen - lists what needs work (failed designators, DRC,
+       ambiguous or distant labels).
+    2. view_silkscreen / get_designator_options - look at each problem area
+       and find legal spots.
+    3. set_designator_positions - place them (dry_run first for neighbours).
+
+    Options default to the settings last saved by the script's GUI
+    (AutoPlaceSilkscreen.ini) when use_saved_settings is on, else the GUI's
+    defaults. Any argument given here overrides them.
+
+    Args:
+        designators (list, optional): Only place these designators. Omit for
+            the whole board (or the selection with selected_only).
+        selected_only (bool): Place only the components selected in Altium.
+        failed_action (str): What to do with designators that could not be
+            placed: "center" (centre them on their part, where
+            check_silkscreen flags them), "hide", or "restore" (put them back
+            where they were).
+        avoid_vias (bool): Treat vias as obstacles.
+        rotation_strategy (str): "component", "horizontal", "along_side",
+            "along_axis", "along_pins" or "klc" (KLC style).
+        positions (list): Autopositions to try, in order: TopCenter,
+            CenterRight, BottomCenter, CenterLeft, TopLeft, TopRight,
+            BottomLeft, BottomRight.
+        try_altered_rotation (bool): Also try the text turned 90 degrees.
+        second_pass (bool): Run the wider "wiggle" search for failures.
+        unhide_all (bool): Show hidden designators first so they get placed.
+        auto_hide (list): Designator prefixes to hide instead of placing,
+            e.g. ["TP", "MT", "FID"]; [] hides none.
+        allow_under (list): Designators whose bodies silk may cover.
+        text_height_mils (float): Fixed text height; 0 = size from the part
+            (shrinks to 25 mil when needed).
+        stroke_width_mils (float): Fixed stroke width; 0 = from the height.
+        position_delta_mils (float): Extra gap between autoposition and part.
+        component_outline_layer (str): Mechanical layer holding component
+            bodies (default "Mechanical 13" or a "Component Outline" layer).
+        use_saved_settings (bool): Start from the GUI's saved settings.
+
+    Returns:
+        str: JSON with placed/failed counts per pass, the failed designators,
+             the settings used and the next step.
+    """
+    settings = dict(AUTOPLACE_DEFAULTS)
+    source = "script defaults"
+    if use_saved_settings:
+        saved = _saved_autoplacer_settings()
+        if saved:
+            settings.update(saved)
+            source = "saved GUI settings (AutoPlaceSilkscreen.ini)"
+    overrides = {"failed_action": failed_action, "avoid_vias": avoid_vias,
+                 "try_altered_rotation": try_altered_rotation, "second_pass": second_pass,
+                 "unhide_all": unhide_all, "auto_hide": auto_hide,
+                 "text_height_mils": text_height_mils, "stroke_width_mils": stroke_width_mils,
+                 "position_delta_mils": position_delta_mils, "positions": positions}
+    settings.update({k: v for k, v in overrides.items() if v is not None})
+    if rotation_strategy is not None:
+        key = str(rotation_strategy).strip().lower().replace(" ", "_")
+        if key.isdigit() and 0 <= int(key) <= 5:
+            settings["rotation_strategy"] = int(key)
+        elif key in AUTOPLACE_ROTATIONS:
+            settings["rotation_strategy"] = AUTOPLACE_ROTATIONS[key]
+        else:
+            return json.dumps({"success": False, "error": f"rotation_strategy must be one of {list(AUTOPLACE_ROTATIONS)}"})
+    if settings["failed_action"] not in ("center", "hide", "restore"):
+        return json.dumps({"success": False, "error": "failed_action must be center, hide or restore"})
+    order = {p.lower(): p for p in AUTOPLACE_POSITIONS}
+    try:
+        settings["positions"] = [order[str(p).strip().lower()] for p in settings["positions"]]
+    except KeyError as e:
+        return json.dumps({"success": False, "error": f"unknown position {e}; use {AUTOPLACE_POSITIONS}"})
+    if not settings["positions"]:
+        return json.dumps({"success": False, "error": "enable at least one position"})
+
+    params = {k: v for k, v in settings.items() if k not in ("auto_hide", "positions",
+                                                             "text_height_mils", "stroke_width_mils")}
+    params.update({
+        "positions": settings["positions"],
+        "fixed_size_mils": float(settings["text_height_mils"] or 0),
+        "fixed_width_mils": float(settings["stroke_width_mils"] or 0),
+        "selected_only": bool(selected_only),
+    })
+    # Arrays are only sent when non-empty: the script reads '"key": []' as absent
+    for key, value in (("designators", designators), ("auto_hide", settings["auto_hide"]),
+                       ("allow_under", allow_under)):
+        if value:
+            params[key] = [str(v) for v in value]
+    if component_outline_layer:
+        params["outline_layer"] = component_outline_layer
+
+    logger.info(f"auto_place_silkscreen ({source}): {params}")
+    response = await altium_bridge.execute_command("auto_place_silkscreen", params, timeout=1800)
+    _silk_snapshot["board"] = None      # every designator may have moved
+    if not response.get("success", False):
+        return json.dumps({"success": False, "error": f"Auto placer failed: {response.get('error', 'Unknown error')}"})
+    result = response.get("result", {})
+    if isinstance(result, str):
+        result = json.loads(result)
+    if not result.get("outline_layer_found"):
+        result["warning"] = ("no component outline layer found - component bodies were not treated "
+                             "as obstacles; pass component_outline_layer")
+    result.pop("outline_layer_found", None)
+    names = {v: k for k, v in AUTOPLACE_ROTATIONS.items()}
+    result["settings"] = dict(settings, rotation_strategy=names[settings["rotation_strategy"]], source=source)
+    result["next"] = ("Run check_silkscreen, then fix what it lists with view_silkscreen, "
+                      "get_designator_options and set_designator_positions.")
+    return json.dumps(result, indent=2)
+
+@_tool(read_only=True)
+async def check_silkscreen(ctx: Context, designators: list = None, preview: bool = False):
+    """
+    Find the designators that need work. Start and finish silkscreen cleanup
+    with this.
+
+    Two parts:
+    - drc: each designator is tested with Altium's own Silk To Silk
+      Clearance, Silk To Solder Mask Clearance and Board Outline Clearance
+      rules (Rule.ActualCheck, the test a batch DRC runs) against nearby
+      silk, pads, vias, mask objects and the board edge. Ground truth for
+      fabrication.
+    - quality: problems DRC does not flag - text far from its part or closer
+      to another part of the same type, over another part's body or under its
+      own (e.g. left on top of its part by an auto-placer), off the board, or
+      rotated to read upside down.
+    needs_attention lists every designator with either kind of problem;
+    hidden lists designators whose display is turned off.
+
+    Args:
+        designators (list, optional): Designators to check. Omit for all.
+        preview (bool): Also return a whole-board view with the problem
+            designators in red (default False).
+
+    Returns:
+        JSON with needs_attention, drc and quality (both grouped by
+        designator), hidden, plus optional view image(s).
+    """
+    try:
+        drc = await _check_silk_drc(designators)
+        board = await _silk_board(refresh=True)
+    except Exception as e:
+        return json.dumps({"success": False, "error": f"Failed to check silkscreen: {e}"})
+
+    scope = designators or list(board.components)
+    boxes = {d: b for d, b in _current_boxes(board).items() if d in scope}
+    quality = {d: p for d, p in silkscreen.evaluate(board, boxes, geometry=False).items() if p}
+    # Labels in an intact label block are linked to their parts: distance and
+    # "reads as" problems do not apply. A disturbed block is a problem itself.
+    blocks = []
+    for rec in _load_blocks(board.file):
+        broken = label_blocks.check_record(board, rec)
+        blocks.append({"parts": rec["members"], "link": rec["link"], "intact": not broken,
+                       **({"marker": rec["marker"]} if rec.get("marker") else {}),
+                       **({"problems": broken} if broken else {})})
+        for d in rec["members"]:
+            if d not in scope:
+                continue
+            if broken:
+                quality.setdefault(d, []).append("label block broken: " + "; ".join(broken))
+            elif d in quality:
+                keep = [p for p in quality[d] if not label_blocks.is_association_problem(p)]
+                if keep:
+                    quality[d] = keep
+                else:
+                    del quality[d]
+    grouped = _group_silk_violations(drc)
+    attention = sorted(set(grouped) | set(quality))
+    summary = {
+        "board": board.file,
+        "checked_count": drc.get("checked_count"),
+        "needs_attention_count": len(attention),
+        "needs_attention": attention,
+        "drc_violation_count": drc.get("violation_count"),
+        "drc": grouped,
+        "quality": quality,
+        "hidden": sorted(d for d in scope if d in board.components and not board.components[d].visible),
+    }
+    if blocks:
+        summary["label_blocks"] = blocks
+    if drc.get("missing_designators"):
+        summary["missing_designators"] = drc["missing_designators"]
+    text = json.dumps(summary, indent=2)
+    if not preview:
+        return text
+    images = []
+    for side in ("T", "B"):
+        side_boxes = {d: b for d, b in boxes.items() if board.components[d].side == side}
+        if side_boxes:
+            images.append(MCPImage(data=silkscreen.render_view(
+                board, side_boxes, side=side, problems=attention, max_px=1600), format="png"))
+    return [text] + images
+
+@_tool(read_only=True)
+async def view_silkscreen(ctx: Context, designators: list = None, region: list = None,
+                          side: str = None, grid_mils: float = 0, refresh: bool = False):
+    """
+    Look at the silkscreen around some designators or in a region.
+
+    Renders one board side cleanly - no Altium UI, no copper clutter - with a
+    grid labelled in mils (board-origin coordinates, the same ones
+    set_designator_positions takes), so a free spot can be read straight off
+    the image. Shows solder mask openings, silk, part names at their centres,
+    every designator box, and marks designators whose current spot has a
+    problem in red. The designators asked about are cyan with a line to
+    their part.
+
+    Uses the board snapshot (refreshed by check_silkscreen, updated by
+    set_designator_positions, at most 5 minutes old). Pass refresh=True after
+    editing the board by hand in Altium.
+
+    Args:
+        designators (list, optional): Zoom to these parts and highlight them.
+        region (list, optional): [x_min, y_min, x_max, y_max] in mils to show
+            instead. Omit both for the whole board.
+        side (str, optional): "top" or "bottom". Default: the side of the
+            first designator, else top.
+        grid_mils (float): Grid spacing; 0 picks one to suit the zoom.
+        refresh (bool): Re-export the board from Altium first.
+
+    Returns:
+        JSON (view bounds, grid, legend, problems of the designators in view)
+        plus the image.
+    """
+    try:
+        board = await _silk_board(refresh)
+        s = _silk_side(side, designators, board)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+    if region:
+        if len(region) != 4:
+            return json.dumps({"success": False, "error": "region must be [x_min, y_min, x_max, y_max]"})
+        x0, y0, x1, y1 = (float(v) for v in region)
+        focus, margin = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)), 0.0
+    elif designators:
+        focus, margin = _focus_around(board, designators, s), 60.0
+        if focus is None:
+            return json.dumps({"success": False, "error": f"none of {designators} is on the {s} side"})
+    else:
+        focus, margin = None, 40.0
+
+    boxes = _current_boxes(board, s)
+    if focus is not None:
+        view = (focus[0] - margin, focus[1] - margin, focus[2] + margin, focus[3] + margin)
+        boxes = {d: b for d, b in boxes.items()
+                 if not (b[0][2] < view[0] or b[0][0] > view[2] or b[0][3] < view[1] or b[0][1] > view[3])}
+    problems = _block_exempt(board, {d: p for d, p in silkscreen.evaluate(board, boxes).items() if p})
+    png = silkscreen.render_view(board, _current_boxes(board, s), focus=focus, side=s,
+                                 targets=designators or (), problems=problems,
+                                 margin=margin, grid=grid_mils or None)
+    info = {
+        "side": "top" if s == "T" else "bottom",
+        "designators_in_view": len(boxes),
+        "legend": SILK_VIEW_LEGEND,
+        "problems": problems,
+    }
+    if focus is not None:
+        info["view_mils"] = [round(v, 1) for v in view]
+    return [json.dumps(info, indent=2), MCPImage(data=png, format="png")]
+
+@_tool(read_only=True)
+async def get_designator_options(ctx: Context, designators: list, count: int = 5,
+                                 max_gap_mils: float = 50, min_height_mils: float = 0,
+                                 refresh: bool = False):
+    """
+    Legal spots for designators, ranked, drawn as numbered boxes.
+
+    For each designator: its current spot and what is wrong with it, then up
+    to `count` distinct legal positions around its part - clear of silk, solder
+    mask openings, untented vias, the board edge and every other designator
+    where it is now, readable, and nearer its own part than any other part of
+    the same type. Ranked by: close to the part, above > left/right > below,
+    text along the part's long axis, centred. Pick one (or use the image to
+    judge a better spot) and apply it with set_designator_positions using the
+    option's x, y and rotation.
+
+    The designators asked about are not obstacles to each other: when placing
+    neighbours, check the chosen spots together with
+    set_designator_positions(dry_run=True) first. When a designator has no
+    legal spot, blocked_by says what is in the way: ask again together with
+    the neighbouring designators (so they can move to make room), allow
+    smaller text (min_height_mils), or place its row's designators as a
+    block with get_label_block_options. Do not hide designators to get rid
+    of problems; only mounting holes and fiducials go without one.
+
+    Args:
+        designators (list): Designators to find spots for.
+        count (int): Options per designator (default 5).
+        max_gap_mils (float): Furthest the text may sit from its part's pads
+            and silk (default 50).
+        min_height_mils (float): Also offer smaller text, down to this height,
+            in 5 mil steps (0 = current size only).
+        refresh (bool): Re-export the board from Altium first.
+
+    Returns:
+        JSON per designator (current spot + problems, options with n, x, y,
+        rotation, side, gap_mils and height when reduced, or blocked_by) plus
+        an image per board side with the options numbered.
+    """
+    try:
+        board = await _silk_board(refresh)
+    except Exception as e:
+        return json.dumps({"success": False, "error": f"Failed to export silkscreen data: {e}"})
+    scope, skipped = silkscreen.split_scope(board, designators or [])
+    if not scope:
+        return json.dumps({"success": False, "error": "no placeable designators", "skipped": skipped})
+
+    opts = silkscreen.Options(max_gap=max_gap_mils, min_height=min_height_mils or None)
+    found = silkscreen.options_for(board, scope, count=max(1, count), options=opts)
+    current = silkscreen.evaluate(board, {d: (board.components[d].text_box,
+                                              board.components[d].text_rotation) for d in scope})
+    result = {}
+    for d in scope:
+        c = board.components[d]
+        entry = {"current": dict(_box_info(c.text_box, c.text_rotation), problems=current[d])}
+        entry["options"] = []
+        for i, cand in enumerate(found[d]["options"], 1):
+            o = {"n": i, "x": round(cand.center[0], 2), "y": round(cand.center[1], 2),
+                 "rotation": round(cand.rotation) % 360,
+                 "side": silkscreen.SIDE_NAMES.get(cand.side_name, cand.side_name),
+                 "gap_mils": round(silkscreen._rect_rect_dist(cand.rect, c.extent), 1)}
+            if cand.note == "reduced height":
+                o["height"] = cand.height
+                o["stroke_width"] = cand.stroke
+            entry["options"].append(o)
+        if found[d]["blocked_by"]:
+            entry["blocked_by"] = found[d]["blocked_by"]
+        result[d] = entry
+    out = {"designators": result, "legend": SILK_VIEW_LEGEND}
+    if skipped:
+        out["skipped"] = skipped
+    images = []
+    for side in ("T", "B"):
+        on_side = [d for d in scope if board.components[d].side == side]
+        if not on_side:
+            continue
+        png = silkscreen.render_view(board, _current_boxes(board, side),
+                                     focus=_focus_around(board, on_side, side), margin=60.0, side=side,
+                                     targets=on_side, problems=[d for d in on_side if current[d]],
+                                     options={d: found[d]["options"] for d in on_side})
+        images.append(MCPImage(data=png, format="png"))
+    return [json.dumps(out, indent=2)] + images
+
+@_tool()
+async def set_designator_positions(ctx: Context, placements: list, dry_run: bool = False,
+                                   verify: bool = True) -> str:
+    """
+    Place designators - by coordinates or relative to their part - and get a
+    verdict for each.
+
+    Each placement is either
+    - absolute: x, y = centre of the text box in mils (board origin), as read
+      off view_silkscreen or taken from get_designator_options, or
+    - relative: side = "above" | "below" | "left" | "right" | "inside" of its
+      own part, with gap (mils from the part's pads/silk; default just clear
+      of them) and offset (slide along that side, +x or +y).
+    Optional on both: rotation (0/90 top, 0/270 bottom read correctly;
+    default keeps a readable current rotation), height and stroke_width
+    (mils), visible (show/hide - hide only mounting holes and fiducials;
+    designators with no room go in a label block, see
+    get_label_block_options). A placement with only visible (or only
+    rotation/height) keeps the current centre.
+
+    dry_run=True changes nothing: every placement is checked against silk,
+    mask openings, the board edge, other designators where they are now and
+    each other, plus placement quality. Use it to test a set of neighbours
+    together before applying.
+
+    Otherwise all moves are one undo step, and with verify (default) each
+    moved designator is then checked with Altium's own silk rules and for
+    quality. ok=true means clean. The moves only go to the board the
+    snapshot was read from: if another PCB has been focused since, nothing
+    moves and the error names both boards.
+
+    Args:
+        placements (list): Dicts with designator plus x/y or side (gap,
+            offset), and optional rotation, height, stroke_width, visible.
+        dry_run (bool): Only check the placements.
+        verify (bool): After moving, run Altium's silk DRC on the moved
+            designators (default True).
+
+    Returns:
+        str: JSON with one verdict per designator: final x, y, rotation,
+             ok and problems.
+    """
+    try:
+        board = await _silk_board()
+    except Exception as e:
+        return json.dumps({"success": False, "error": f"Failed to export silkscreen data: {e}"})
+
+    errors, resolved, entries = [], {}, []
+    for idx, p in enumerate(placements or []):
+        des = str(p.get("designator", "")).strip() if isinstance(p, dict) else ""
+        if not des or des not in board.components:
+            errors.append(f"placements[{idx}]: unknown designator {des!r}")
+            continue
+        if "|" in des:
+            errors.append(f"placements[{idx}]: designator must not contain '|'")
+            continue
+        if ("x" in p) != ("y" in p):
+            errors.append(f"placements[{idx}]: give both x and y, or neither")
+            continue
+        try:
+            rect, rot, height, stroke = silkscreen.resolve_placement(board, p)
+        except (TypeError, ValueError) as e:
+            errors.append(f"placements[{idx}]: {e}")
+            continue
+        visible = p.get("visible")
+        resolved[des] = (rect, rot, visible)
+        cx, cy = (rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2
+        size = f"{height:g}" if p.get("height") is not None else ""
+        width = f"{stroke:g}" if p.get("height") is not None or p.get("stroke_width") is not None else ""
+        vis = "" if visible is None else ("1" if visible else "0")
+        entries.append(f"{des}|{cx:.3f}|{cy:.3f}|{rot:g}|{size}|{width}|{vis}")
+    if errors:
+        return json.dumps({"success": False, "error": "; ".join(errors)})
+    if not entries:
+        return json.dumps({"success": False, "error": "No placements provided"})
+
+    shown = {d: (r, rot) for d, (r, rot, vis) in resolved.items()
+             if vis is not False and (vis or board.components[d].visible)}
+    if dry_run:
+        problems = silkscreen.evaluate(board, shown, hiding=set(resolved) - set(shown))
+        verdicts = {d: dict(_box_info(r, rot), ok=not problems.get(d), problems=problems.get(d, []))
+                    for d, (r, rot) in shown.items()}
+        for d in set(resolved) - set(shown):
+            verdicts[d] = {"hidden": True}
+        return json.dumps({"dry_run": True, "all_ok": all(v.get("ok", True) for v in verdicts.values()),
+                           "designators": verdicts}, indent=2)
+
+    params = {"placements": entries}
+    if board.file:
+        # Altium refuses the moves if another PCB is focused by now
+        params["board"] = board.file.replace("\\", "/")
+    response = await altium_bridge.execute_command("place_designators", params)
+    if not response.get("success", False):
+        return json.dumps({"success": False, "error": f"Failed to move designators: {response.get('error', 'Unknown error')}"})
+    result = response.get("result", {})
+    if isinstance(result, str):
+        result = json.loads(result)
+
+    # Keep the snapshot in step with what Altium reports
+    final = {}
+    for item in result.get("designators", []):
+        c = board.components.get(item["designator"])
+        if c is None:
+            continue
+        cx, cy, w, h = item["cx"], item["cy"], item["width"], item["height"]
+        c.text_rotation = item["rotation"]
+        c.text_height = item.get("text_height", c.text_height)
+        c.stroke = item.get("stroke_width", c.stroke)
+        c.text_box = silkscreen.ink_box((cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2),
+                                        c.stroke, c.truetype)
+        c.visible = item.get("visible", c.visible)
+        c.autopos = 0
+        final[c.designator] = c
+
+    verdicts = {}
+    moved = sorted(d for d, c in final.items() if c.visible)
+    grouped = {}
+    if verify and moved:
+        try:
+            grouped = _group_silk_violations(await _check_silk_drc(moved))
+        except Exception as e:
+            grouped = {d: [f"DRC check failed: {e}"] for d in moved}
+    quality = silkscreen.evaluate(board, {d: (final[d].text_box, final[d].text_rotation) for d in moved},
+                                  geometry=False)
+    for d, c in sorted(final.items()):
+        if not c.visible:
+            verdicts[d] = {"hidden": True}
+            continue
+        problems = grouped.get(d, []) + quality.get(d, [])
+        verdicts[d] = dict(_box_info(c.text_box, c.text_rotation), ok=not problems, problems=problems)
+        if c.text_height:
+            verdicts[d]["text_height"] = c.text_height
+    out = {"moved_count": len(final), "verified": bool(verify),
+           "all_ok": all(v.get("ok", True) for v in verdicts.values()), "designators": verdicts}
+    if result.get("missing_designators"):
+        out["missing_designators"] = result["missing_designators"]
+    return json.dumps(out, indent=2)
+
+# Label blocks applied with place_label_block, per board file, so that
+# check_silkscreen can tell a block's labels from labels that wandered off.
+# Kept in the exchange folder, never next to the board.
+SILK_BLOCKS_FILE = EXCHANGE_DIR / "silk_label_blocks.json"
+_block_options_cache = {}
+
+def _load_blocks(board_file: str) -> list:
+    try:
+        data = json.loads(SILK_BLOCKS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return data.get(board_file.lower(), [])
+
+def _save_blocks(board_file: str, records: list):
+    try:
+        data = json.loads(SILK_BLOCKS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    data[board_file.lower()] = records
+    SILK_BLOCKS_FILE.write_text(json.dumps(data, indent=1), encoding="utf-8")
+
+def _update_snapshot_graphics(removed_records: list, added_option):
+    """Keep the board snapshot in step with link graphics just drawn or
+    deleted, instead of exporting the whole board again (every export leaks
+    memory in Altium's script engine)."""
+    board = _silk_snapshot["board"]
+    if board is None:
+        return
+    for r in removed_records:
+        label_blocks.drop_graphics(board, r["side"], r["graphics"])
+    if added_option is not None and added_option.graphics:
+        board._parse("\n".join(label_blocks.graphics_lines(added_option.side, added_option.graphics)))
+
+def _replaced_graphics(records: list, members: list) -> list:
+    """Link graphics of earlier blocks of these parts (placing replaces them)."""
+    return [g for r in records if set(r["members"]) & set(members) for g in r["graphics"]]
+
+def _block_members(board, designators: list, whole_row: bool = True) -> list:
+    """The parts of a block: one designator stands for its whole row unless
+    whole_row is off."""
+    names = [str(d).strip() for d in designators or []]
+    missing = [d for d in names if d not in board.components]
+    if missing:
+        raise ValueError(f"not on the board: {missing}")
+    if len(names) == 1 and whole_row:
+        return label_blocks.find_row(board, names[0])[1]
+    return names
+
+def _block_exempt(board, problems: dict) -> dict:
+    """problems without the distance and "reads as" problems of labels in
+    intact label blocks (their link answers those)."""
+    out = dict(problems)
+    for rec in _load_blocks(board.file):
+        if label_blocks.check_record(board, rec):
+            continue
+        for d in rec["members"]:
+            if d in out:
+                keep = [p for p in out[d] if not label_blocks.is_association_problem(p)]
+                if keep:
+                    out[d] = keep
+                else:
+                    del out[d]
+    return out
+
+def _block_image(board, option) -> bytes:
+    side = option.side
+    boxes = {d: b for d, b in _current_boxes(board, side).items() if d not in option.members}
+    for d, (rect, rot, _, _) in option.labels.items():
+        boxes[d] = (rect, rot)
+    focus = label_blocks._bounds(
+        [label_blocks._bounds(board.components[d].extent for d in option.members), option.rect] +
+        [r for g in option.graphics for r in label_blocks._graphic_rects(g)])
+    return silkscreen.render_view(board, boxes, focus=focus, side=side, targets=option.members,
+                                  margin=60.0, graphics=option.graphics)
+
+@_tool(read_only=True)
+async def get_label_block_options(ctx: Context, designators: list, count: int = 3,
+                                  min_height_mils: float = 25, max_distance_mils: float = 500,
+                                  link: str = "auto", whole_row: bool = True, refresh: bool = False):
+    """
+    Place a row of parts' designators together as a block, when they do not
+    fit next to their parts one by one. Use this instead of hiding
+    designators (only mounting holes and fiducials go without one).
+
+    Parts in a row get their designators in a row too, in the same order,
+    even some way off. Give one designator to use the whole row it belongs
+    to (parts side by side along x or y, similar size across the row, gaps
+    up to 50 mil), or list the parts yourself. For a block of just one part
+    (its label alone, linked to it), give it with whole_row=False.
+
+    Each option is a block of labels - across the row (in line with each
+    part when the pitch allows, else side by side) or end to end along it -
+    clear of silk, mask openings, the board edge, other designators and part
+    bodies, plus a link when it is not right against the row:
+    - leader: a silk line with an arrowhead from the block to the parts;
+    - index: matching markers - a capital letter in a circle (then square,
+      then triangle) - next to the block and next to the parts.
+    Ranked: no link, then leader, then index; nearer and larger text first.
+    Apply one with place_label_block.
+
+    Args:
+        designators (list): One designator (its row is used) or the block's parts.
+        count (int): Options to return (default 3).
+        min_height_mils (float): Smallest text allowed (default 25).
+        max_distance_mils (float): Furthest the block may sit from the parts (default 500).
+        link (str): "auto" (cheapest), "none", "leader" or "index".
+        whole_row (bool): With one designator, use its whole row (default)
+            or just that part.
+        refresh (bool): Re-export the board from Altium first.
+
+    Returns:
+        JSON with the parts in order and the numbered options, plus an image
+        per option (block labels cyan with lines to their parts, link magenta).
+    """
+    if link not in ("auto", "none", "leader", "index"):
+        return json.dumps({"success": False, "error": "link must be auto, none, leader or index"})
+    try:
+        board = await _silk_board(refresh)
+        members = _block_members(board, designators, whole_row)
+        records = _load_blocks(board.file)
+        used = label_blocks.used_markers(board, records)
+        axis, members, options = label_blocks.block_options(
+            board, members, count=max(1, count), min_height=min_height_mils,
+            max_distance=max_distance_mils, link=link, used_markers=used,
+            ignore=_replaced_graphics(records, members))
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+    _block_options_cache[(board.file.lower(), tuple(members))] = {
+        "time": _silk_snapshot["time"], "options": options,
+        "params": dict(min_height=min_height_mils, max_distance=max_distance_mils, link=link)}
+    out = {"parts": members, "row_axis": axis,
+           "options": [o.to_dict(i) for i, o in enumerate(options, 1)]}
+    if not options:
+        out["note"] = ("no block fits; allow a longer max_distance_mils or smaller text, or move "
+                       "other designators out of the way first")
+    return [json.dumps(out, indent=2)] + [MCPImage(data=_block_image(board, o), format="png") for o in options]
+
+@_tool()
+async def place_label_block(ctx: Context, designators: list, option: int = 1,
+                            whole_row: bool = True) -> str:
+    """
+    Apply a label block from get_label_block_options: move the parts'
+    designators into the block (shown, at the block's text size) and draw
+    its link on the silkscreen, then check both with Altium's rules. An
+    earlier block of any of these parts is replaced (its link removed).
+
+    Args:
+        designators (list): The same designators given to get_label_block_options.
+        option (int): Which option (default 1).
+        whole_row (bool): As given to get_label_block_options.
+
+    Returns:
+        JSON: the block's parts, link and marker, ok, and any Altium
+        violations of the labels or the link graphics.
+    """
+    try:
+        board = await _silk_board()
+        members = _block_members(board, designators, whole_row)
+        axis = label_blocks.row_axis(board, members)
+        members = sorted(members, key=lambda d: label_blocks._reading_key(board.components[d], axis))
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+    records = _load_blocks(board.file)
+    key = (board.file.lower(), tuple(members))
+    cached = _block_options_cache.get(key)
+    note = None
+    if cached is None or cached["time"] != _silk_snapshot["time"]:
+        params = cached["params"] if cached else {}
+        _, _, options = label_blocks.block_options(
+            board, members, count=max(3, option), used_markers=label_blocks.used_markers(board, records),
+            ignore=_replaced_graphics(records, members), **params)
+        note = "board changed since the options were listed - recomputed them"
+    else:
+        options = cached["options"]
+    if not 1 <= option <= len(options):
+        return json.dumps({"success": False, "error": f"option {option} does not exist ({len(options)} options)",
+                           "note": note})
+    opt = options[option - 1]
+
+    old = [r for r in records if set(r["members"]) & set(members)]
+    items = []
+    for r in old:
+        items += label_blocks.to_items(r["side"], r["graphics"], "-")
+    items += label_blocks.to_items(opt.side, opt.graphics, "+")
+
+    moved = json.loads(await set_designator_positions(ctx, opt.placements(), verify=False))
+    if "designators" not in moved:
+        return json.dumps({"success": False, "error": moved.get("error", "moving the labels failed")})
+    graphic_problems = []
+    if items:
+        response = await altium_bridge.execute_command(
+            "edit_silk_graphics", {"items": items, "board": board.file.replace("\\", "/")})
+        if not response.get("success", False):
+            _silk_snapshot["board"] = None
+            return json.dumps({"success": False, "error": f"labels moved, but drawing the link failed: "
+                                                          f"{response.get('error', 'Unknown error')}"})
+        result = response.get("result", {})
+        if isinstance(result, str):
+            result = json.loads(result)
+        graphic_problems = [f"{v['rule']}: {v['object']} {v.get('owner', '')} {v.get('detail', '')}".strip()
+                            for v in result.get("violations", [])]
+        if result.get("not_found"):
+            graphic_problems.append(f"old link graphics not found: {result['not_found']}")
+        _update_snapshot_graphics(old, opt)
+    try:
+        label_problems = _group_silk_violations(await _check_silk_drc(list(members)))
+    except Exception as e:
+        label_problems = {d: [f"DRC check failed: {e}"] for d in members}
+
+    records = [r for r in records if r not in old] + [label_blocks.record(opt)]
+    _save_blocks(board.file, records)
+    out = {"parts": members, "summary": opt.summary, "link": opt.link,
+           "ok": not label_problems and not graphic_problems,
+           "label_problems": label_problems, "link_problems": graphic_problems}
+    if opt.marker:
+        out["marker"] = {"letter": opt.marker[0], "shape": opt.marker[1]}
+    if old:
+        out["replaced_blocks"] = [r["members"] for r in old]
+    if note:
+        out["note"] = note
+    return json.dumps(out, indent=2)
+
+@_tool()
+async def remove_label_block(ctx: Context, designators: list) -> str:
+    """
+    Remove the label block of these parts: its link graphics (leader or
+    index markers) are deleted; the designators stay where they are, ready
+    to be placed again.
+
+    Args:
+        designators (list): Any of the block's parts.
+
+    Returns:
+        JSON with the removed block's parts and link.
+    """
+    try:
+        board = await _silk_board()
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+    records = _load_blocks(board.file)
+    names = {str(d).strip() for d in designators or []}
+    old = [r for r in records if names & set(r["members"])]
+    if not old:
+        return json.dumps({"success": False, "error": f"no label block holds any of {sorted(names)}"})
+    items = [i for r in old for i in label_blocks.to_items(r["side"], r["graphics"], "-")]
+    if items:
+        response = await altium_bridge.execute_command(
+            "edit_silk_graphics", {"items": items, "board": board.file.replace("\\", "/")})
+        if not response.get("success", False):
+            _silk_snapshot["board"] = None
+            return json.dumps({"success": False, "error": response.get("error", "Unknown error")})
+        _update_snapshot_graphics(old, None)
+    _save_blocks(board.file, [r for r in records if r not in old])
+    return json.dumps({"removed": [{"parts": r["members"], "link": r["link"]} for r in old]}, indent=2)
+
+@_tool()
+async def place_vias(ctx: Context, vias: list, diameter_mils: float, hole_mils: float,
+                     net: str = "", start_layer: str = "Top Layer", end_layer: str = "Bottom Layer",
+                     board_path: str = "") -> str:
+    """
+    Add vias to a PCB: stitching, fan-out, or a via at the end of a track.
+
+    Args:
+        vias (list): Via positions in mils relative to the board origin,
+            each [x, y] or an object {"x": .., "y": .., "net": ..,
+            "diameter_mils": .., "hole_mils": .., "start_layer": ..,
+            "end_layer": ..} whose keys override the defaults below for
+            that via.
+        diameter_mils (float): Via pad diameter.
+        hole_mils (float): Drill diameter, smaller than diameter_mils.
+        net (str): Net of the vias; it must exist on the board. Empty for
+            vias without a net.
+        start_layer (str): Layer the via starts on, e.g. "Top Layer".
+        end_layer (str): Layer it ends on, e.g. "Bottom Layer". Set both for
+            a blind or buried via.
+        board_path (str): Full path of the .PcbDoc; empty for the focused
+            board, or the one the PCB tools last used.
+
+    Every net and layer is checked before anything is added, so a bad entry
+    adds nothing. Run run_drc afterwards: a via is not checked against
+    clearance when it is placed.
+
+    Returns:
+        str: JSON with how many vias were added.
+    """
+    board_path = long_path(board_path)
+    records, error = routing.via_records(vias, diameter_mils, hole_mils, net, start_layer, end_layer)
+    if error:
+        return json.dumps({"success": False, "error": error})
+
+    logger.info(f"Placing {len(records)} vias")
+    response = await altium_bridge.execute_command("create_vias", {
+        "vias": ";".join(records), "board_path": board_path})
+    if not response.get("success", False):
+        return json.dumps({"success": False,
+                           "error": f"Failed to add the vias: {response.get('error', 'unknown error')}"})
+    result = response.get("result", {})
+    return json.dumps(result, indent=2) if not isinstance(result, str) else result
+
+# Changes the design: a timeout leaves its outcome unknown, so no blind retry
+MUTATING_COMMANDS.add("create_vias")
+
+
+def _bring_to_front(hwnd):
+    """Give a window the foreground from this background process.
+
+    Windows usually refuses SetForegroundWindow from a background process.
+    While attached to the foreground thread, BringWindowToTop does the job
+    without a key press. A synthetic Alt also lifts the refusal, but it lands
+    on whichever window is in front: usually the program the user is typing
+    in, and if that is Altium, its menu bar stays active for the next keys.
+    """
+    this_thread = win32api.GetCurrentThreadId()
+    front = win32gui.GetForegroundWindow()
+    front_thread = win32process.GetWindowThreadProcessId(front)[0] if front else 0
+    attached = False
+    try:
+        if front_thread and front_thread != this_thread:
+            win32process.AttachThreadInput(this_thread, front_thread, True)
+            attached = True
+        try:
+            win32gui.SetForegroundWindow(hwnd)
+        except Exception as e:
+            logger.debug(f"SetForegroundWindow refused: {e}")
+        win32gui.BringWindowToTop(hwnd)
+    except Exception as e:
+        logger.debug(f"Could not bring the window to the front: {e}")
+    finally:
+        if attached:
+            win32process.AttachThreadInput(this_thread, front_thread, False)
+
+
+def _grab_window_image(hwnd, width: int, height: int) -> Image.Image:
+    """Copy a window's pixels, frame included, into an RGB image.
+
+    Every GDI object is released even when a step fails, so a failed capture
+    does not leak device contexts or the bitmap.
+    """
+    hwnd_dc = win32gui.GetWindowDC(hwnd)
+    mfc_dc = save_dc = bitmap = None
+    try:
+        mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
+        save_dc = mfc_dc.CreateCompatibleDC()
+        bitmap = win32ui.CreateBitmap()
+        bitmap.CreateCompatibleBitmap(mfc_dc, width, height)
+        save_dc.SelectObject(bitmap)
+        save_dc.BitBlt((0, 0), (width, height), mfc_dc, (0, 0), win32con.SRCCOPY)
+        info = bitmap.GetInfo()
+        return Image.frombuffer('RGB', (info['bmWidth'], info['bmHeight']),
+                                bitmap.GetBitmapBits(True), 'raw', 'BGRX', 0, 1)
+    finally:
+        # The memory DC goes first: a bitmap still selected into a DC is not deleted
+        if save_dc is not None:
+            save_dc.DeleteDC()
+        if bitmap is not None and bitmap.GetHandle():
+            win32gui.DeleteObject(bitmap.GetHandle())
+        if mfc_dc is not None:
+            mfc_dc.DeleteDC()
+        win32gui.ReleaseDC(hwnd, hwnd_dc)
+
+
+@_tool(read_only=True)
 async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = None):
     """
     Take a screenshot of the Altium window, returned as viewable image content.
+
+    Altium comes to the front for about a second, because it only paints
+    what is on screen, and the window that was in front then gets the
+    foreground back.
 
     Args:
         view_type (str): Type of view to capture - 'pcb' or 'sch'
@@ -2734,6 +4658,7 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
         (window title, size, zoomed component count)
     """
     logger.info(f"Taking screenshot of Altium {view_type} window (zoom_to={zoom_to})")
+    previous_window = win32gui.GetForegroundWindow()
 
     try:
         # First, execute the Altium command to ensure the right document type
@@ -2772,32 +4697,34 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
                 "focused_kind": focused_kind,
                 "focused_document": focused_document})
 
-        # Run the screenshot capture in a separate thread
-        import threading
-        import queue
-        import datetime
-        from PIL import Image
-        
-        result_queue = queue.Queue()
-        
-        def capture_screenshot_thread():
-            try:
-                # Work in physical pixels. Python is not DPI aware, so on a
-                # scaled display Windows hands this process window rects
-                # divided by the scale factor (1080x902 for a 2160x1804
-                # window at 200%), while the BitBlt below copies the window's
-                # real pixels: the capture came back as only the top-left
-                # part of the window. Per-monitor awareness for this thread
-                # alone gives GetWindowRect the physical size and ends with
-                # the thread. V2 (-4) needs Windows 10 1703; V1 (-3) is the
-                # fallback.
-                import ctypes
-                set_dpi_context = ctypes.windll.user32.SetThreadDpiAwarenessContext
-                set_dpi_context.restype = ctypes.c_void_p
-                set_dpi_context.argtypes = [ctypes.c_void_p]
-                if not (set_dpi_context(-4) or set_dpi_context(-3)):
-                    logger.warning("Could not make the capture thread DPI aware; on a scaled display the capture may show only part of the window")
+        # The capture runs in a worker thread: it waits for Altium to come to
+        # the front and paint, which must not block the server's event loop
+        import ctypes
 
+        def capture_in_physical_pixels():
+            # Work in physical pixels. Python is not DPI aware, so on a
+            # scaled display Windows hands this process window rects
+            # divided by the scale factor (1080x902 for a 2160x1804
+            # window at 200%), while the BitBlt copies the window's real
+            # pixels: the capture came back as only the top-left part of
+            # the window. Per-monitor awareness for this thread gives
+            # GetWindowRect the physical size. The worker thread is pooled
+            # and reused, so its previous setting is restored afterwards.
+            # V2 (-4) needs Windows 10 1703; V1 (-3) is the fallback.
+            set_dpi_context = ctypes.windll.user32.SetThreadDpiAwarenessContext
+            set_dpi_context.restype = ctypes.c_void_p
+            set_dpi_context.argtypes = [ctypes.c_void_p]
+            previous_dpi_context = set_dpi_context(-4) or set_dpi_context(-3)
+            if not previous_dpi_context:
+                logger.warning("Could not make the capture thread DPI aware; on a scaled display the capture may show only part of the window")
+            try:
+                return capture_screenshot()
+            finally:
+                if previous_dpi_context:
+                    set_dpi_context(previous_dpi_context)
+
+        def capture_screenshot():
+            try:
                 # Find Altium windows
                 altium_windows = []
                 altium_fallback_windows = []
@@ -2831,12 +4758,11 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
                     altium_windows = altium_fallback_windows
                 
                 if not altium_windows:
-                    result_queue.put({
-                        "success": False, 
+                    return {
+                        "success": False,
                         "error": f"No Altium windows found for {view_type} view"
-                    })
-                    return
-                
+                    }
+
                 # Altium owns several top-level windows with its name in the
                 # title, and while it switches documents a small transient one
                 # can come first. Take the largest window that is not
@@ -2851,12 +4777,12 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
                 # Bring Altium to the front and let it paint. Altium only
                 # renders a schematic view once it has actually been shown on
                 # screen, so a capture taken while it sits behind another
-                # window comes back with a blank canvas. Windows may refuse
-                # SetForegroundWindow from a process that neither is nor was
-                # started by the foreground process; a synthetic Alt press
-                # before the call is the standard unlock and is harmless.
+                # window comes back with a blank canvas. Letters typed while
+                # it is in front go to its menus (W then H tiles the
+                # documents), so whoever was in front gets the foreground back.
                 activated = False
                 altium_pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+                previous_pid = win32process.GetWindowThreadProcessId(previous_window)[1] if previous_window else 0
 
                 def altium_is_foreground():
                     # Altium owns several top-level windows; any of them
@@ -2865,21 +4791,12 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
                     return bool(fg) and win32process.GetWindowThreadProcessId(fg)[1] == altium_pid
 
                 try:
-                    for attempt in range(2):
-                        if attempt:
-                            ctypes.windll.user32.keybd_event(0x12, 0, 0, 0)
-                            ctypes.windll.user32.keybd_event(0x12, 0, 2, 0)
-                        try:
-                            win32gui.SetForegroundWindow(hwnd)
-                        except Exception:
-                            pass
-                        deadline = time.time() + 1.5
-                        while time.time() < deadline:
-                            time.sleep(0.1)
-                            if altium_is_foreground():
-                                activated = True
-                                break
-                        if activated:
+                    _bring_to_front(hwnd)
+                    deadline = time.time() + 1.5
+                    while time.time() < deadline:
+                        time.sleep(0.1)
+                        if altium_is_foreground():
+                            activated = True
                             break
                 except Exception as e:
                     logger.warning(f"Could not bring window to foreground: {e}")
@@ -2894,55 +4811,38 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
                 width = right - left
                 height = bottom - top
                 if width < 200 or height < 150:
-                    result_queue.put({"success": False, "error": f"Altium window is too small to capture ({width}x{height}); is it minimized?"})
-                    return
-                
+                    return {"success": False, "error": f"Altium window is too small to capture ({width}x{height}); is it minimized?"}
+
                 # Take screenshot using GDI functions instead of ImageGrab
                 try:
-                    # Get device context
-                    hwndDC = win32gui.GetWindowDC(hwnd)
-                    mfcDC = win32ui.CreateDCFromHandle(hwndDC)
-                    saveDC = mfcDC.CreateCompatibleDC()
-                    
-                    # Create a bitmap object
-                    saveBitMap = win32ui.CreateBitmap()
-                    saveBitMap.CreateCompatibleBitmap(mfcDC, width, height)
-                    saveDC.SelectObject(saveBitMap)
-                    
-                    # Copy the screen into the bitmap
-                    saveDC.BitBlt((0, 0), (width, height), mfcDC, (0, 0), win32con.SRCCOPY)
-                    
-                    # Convert the bitmap to an Image
-                    bmpinfo = saveBitMap.GetInfo()
-                    bmpstr = saveBitMap.GetBitmapBits(True)
-                    img = Image.frombuffer(
-                        'RGB',
-                        (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
-                        bmpstr, 'raw', 'BGRX', 0, 1)
-                    
-                    # Save a local copy of the screenshot for debugging (non-fatal if it fails)
                     try:
-                        debug_filename = str(MCP_DIR / f"screenshot_{view_type}.png")
-                        img.save(debug_filename)
-                        logger.info(f"Saved debug screenshot to {debug_filename}")
-                    except Exception as save_error:
-                        logger.warning(f"Could not save debug screenshot to {debug_filename}: {save_error}")
-                        debug_filename = None  # Clear it since save failed
-                    
-                    # Clean up GDI resources
-                    win32gui.DeleteObject(saveBitMap.GetHandle())
-                    saveDC.DeleteDC()
-                    mfcDC.DeleteDC()
-                    win32gui.ReleaseDC(hwnd, hwndDC)
-                    
-                    # Convert to base64
+                        img = _grab_window_image(hwnd, width, height)
+                    finally:
+                        # Not when the user has already moved on by themselves
+                        if previous_pid not in (0, altium_pid) and altium_is_foreground():
+                            _bring_to_front(previous_window)
+
+                    # Encode once: the same PNG bytes are returned and, when
+                    # asked for, kept as a debug copy
                     buffer = io.BytesIO()
                     img.save(buffer, format='PNG')
-                    buffer.seek(0)
-                    img_base64 = base64.b64encode(buffer.read()).decode('utf-8')
-                    
-                    # Put result in queue
-                    result_queue.put({
+                    png_bytes = buffer.getvalue()
+
+                    # A debug copy only on request, and with the per-user
+                    # data: the install folder is replaced on every update
+                    # (non-fatal if it fails)
+                    debug_filename = None
+                    if os.environ.get("ALTIUM_MCP_DEBUG_SCREENSHOTS", "") not in ("", "0"):
+                        try:
+                            debug_path = _data_dir() / f"screenshot_{view_type}.png"
+                            debug_path.parent.mkdir(parents=True, exist_ok=True)
+                            debug_path.write_bytes(png_bytes)
+                            debug_filename = str(debug_path)
+                            logger.info(f"Saved debug screenshot to {debug_filename}")
+                        except Exception as save_error:
+                            logger.warning(f"Could not save debug screenshot: {save_error}")
+
+                    return {
                         "success": True,
                         "width": width,
                         "height": height,
@@ -2951,47 +4851,35 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
                         "view_type": view_type,
                         "foreground_confirmed": activated,
                         "image_format": "PNG",
-                        "encoding": "base64",
                         "debug_file": debug_filename,
-                        "image_data": img_base64
-                    })
-                    
+                        "image_data": png_bytes
+                    }
+
                 except Exception as e:
                     import traceback
                     trace = traceback.format_exc()
                     logger.error(f"GDI screenshot error: {e}\n{trace}")
-                    result_queue.put({
-                        "success": False, 
+                    return {
+                        "success": False,
                         "error": f"GDI screenshot failed: {str(e)}",
                         "traceback": trace
-                    })
-                
+                    }
+
             except Exception as e:
                 import traceback
-                result_queue.put({
-                    "success": False, 
+                return {
+                    "success": False,
                     "error": f"Screenshot thread error: {str(e)}",
                     "traceback": traceback.format_exc()
-                })
-        
-        # Start the thread
-        thread = threading.Thread(target=capture_screenshot_thread)
-        thread.daemon = True
-        thread.start()
-        
-        # Wait for the thread to complete
-        thread.join(timeout=10)  # 10 second timeout
-        
-        if thread.is_alive():
+                }
+
+        # A capture that hangs (Altium never painting, a stuck window call)
+        # gives up after 10 s; the worker thread then finishes on its own
+        try:
+            result = await asyncio.wait_for(asyncio.to_thread(capture_in_physical_pixels), timeout=10)
+        except asyncio.TimeoutError:
             logger.error("Screenshot thread timed out")
             return json.dumps({"success": False, "error": "Screenshot operation timed out"})
-        
-        # Get the result from the queue
-        if result_queue.empty():
-            logger.error("Screenshot thread did not return a result")
-            return json.dumps({"success": False, "error": "Screenshot thread did not return a result"})
-        
-        result = result_queue.get()
 
         if not result.get("success", False):
             error_msg = result.get("error", "Unknown error")
@@ -3004,8 +4892,7 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
         # base64 text: raw base64 in the text result exceeds client token
         # limits (a full-window capture is ~300 KB), while image blocks are
         # rendered natively by clients
-        image_base64 = result.pop("image_data")
-        result.pop("encoding", None)
+        png_bytes = result.pop("image_data")
         zoom_info = response.get("result", {})
         if isinstance(zoom_info, dict) and "zoomed_component_count" in zoom_info:
             result["zoomed_component_count"] = zoom_info["zoomed_component_count"]
@@ -3014,14 +4901,14 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
         result["captured_document"] = focused_document or None
         return [
             json.dumps(result),
-            MCPImage(data=base64.b64decode(image_base64), format="png"),
+            MCPImage(data=png_bytes, format="png"),
         ]
 
     except Exception as e:
         logger.error(f"Error in screenshot function: {str(e)}")
         return json.dumps({"success": False, "error": f"Failed to take screenshot: {str(e)}"})
     
-@mcp.tool()
+@_tool()
 async def layout_duplicator(ctx: Context) -> str:
     """
     First step of layout duplication. Selects source components and returns data to match with destination components.
@@ -3063,7 +4950,7 @@ async def layout_duplicator(ctx: Context) -> str:
     logger.info(f"Retrieved layout duplicator component data")
     return json.dumps(components_data, indent=2)
 
-@mcp.tool()
+@_tool()
 async def layout_duplicator_apply(ctx: Context, source_designators: list, destination_designators: list) -> str:
     """
     Second step of layout duplication. Applies the layout of source components to destination components.
@@ -3098,13 +4985,15 @@ async def layout_duplicator_apply(ctx: Context, source_designators: list, destin
     logger.info(f"Layout duplication applied successfully")
     return json.dumps(result, indent=2)
     
-@mcp.tool()
+@_tool(read_only=True)
 async def get_pcb_rules(ctx: Context) -> str:
     """
     Get all design rules from the current Altium PCB
     
     Returns:
-        str: JSON array of PCB design rules with their properties
+        str: JSON array of PCB design rules: name, enabled, priority (1 is
+             the highest within a rule kind), descriptor, rule_kind and the
+             two scope expressions (filter1, filter2)
     """
     logger.info("Getting PCB design rules")
     
@@ -3130,7 +5019,89 @@ async def get_pcb_rules(ctx: Context) -> str:
     logger.info(f"Retrieved PCB rules data")
     return json.dumps(rules_data, indent=2)
 
-@mcp.tool()
+@_tool()
+async def run_drc(ctx: Context, board_path: str = "", max_violations: int = 200) -> str:
+    """
+    Run the design rule check (DRC) on a PCB and list the violations.
+
+    Runs Altium's own batch DRC with the board's rules and the options last
+    set in its Design Rule Checker dialog. The dialog is answered from
+    outside Altium: it may flash on screen. Altium writes its usual report
+    beside the board (or in the project's output folder) and may open it.
+    The violations stay on the board, marked as Altium marks them.
+
+    A cancelled check leaves no violations, exactly like a clean board, so
+    "ran" says whether the check really ran: the Run button was pressed and
+    the dialog closed. "report" (when Altium wrote one) gives the per-rule
+    counts and confirms it independently.
+
+    Args:
+        board_path (str): Full path of the .PcbDoc to check. It is opened if
+            needed and brought to the front. Empty: the focused board, or
+            the one the PCB tools last used.
+        max_violations (int): How many violations to list in full.
+            violation_count counts every violation the check found, but
+            Altium stops the check at its own violation limit (500 unless
+            changed in its Design Rule Checker dialog); "complete": false
+            then says the board may have more.
+
+    Returns:
+        str: JSON with ran, violation_count, the violations (rule,
+             description, x_mils/y_mils relative to the board origin, and
+             the primitives involved with their net and layer), and the
+             report's per-rule counts.
+    """
+    import drc
+
+    board_path = long_path(board_path)
+    logger.info(f"Running DRC on {board_path or 'the focused board'}")
+    started = time.time()
+    outcome = drc.DialogOutcome()
+    driver = asyncio.create_task(drc.drive_dialog(outcome, PROGRESS_FILE))
+    try:
+        response = await altium_bridge.execute_command(
+            "run_drc", {"board_path": board_path, "max_violations": int(max_violations)})
+    finally:
+        driver.cancel()
+        try:
+            await driver
+        except asyncio.CancelledError:
+            pass
+
+    if not response.get("success", False):
+        return json.dumps({"success": False, "ran": outcome.pressed,
+                           "error": f"DRC failed: {response.get('error', 'unknown error')}"})
+    result = response.get("result", {})
+    if isinstance(result, str):
+        try:
+            result = json.loads(result, strict=False)
+        except ValueError:
+            return json.dumps({"success": False, "error": f"unexpected reply: {result[:200]}"})
+
+    out = {"success": True, "ran": outcome.pressed}
+    if not outcome.pressed:
+        out["success"] = False
+        out["error"] = ("The check did not run: " +
+                        ("the Design Rule Checker dialog could not be started and was closed. "
+                         if outcome.seen else "the Design Rule Checker dialog never appeared. ") +
+                        "violation_count is what was already on the board, not a result.")
+        if outcome.notes:
+            out["notes"] = outcome.notes
+    out.update({k: v for k, v in result.items() if k != "success"})
+    report = drc.find_report(result.get("board", board_path), started)
+    if report is not None:
+        try:
+            out["report"] = {"path": str(report),
+                             **drc.parse_report(read_altium_text(report))}
+        except OSError:
+            pass
+    if out.get("report", {}).get("stopped"):
+        out["complete"] = False
+        out["note"] = ("Altium stopped the check at its violation limit (set in its Design Rule "
+                       "Checker dialog), so the board may have more violations than violation_count.")
+    return json.dumps(out, indent=2)
+
+@_tool(read_only=True)
 async def get_pcb_layer_stackup(ctx: Context) -> str:
     """
     Get the detailed layer stackup information from the current Altium PCB including
@@ -3163,7 +5134,83 @@ async def get_pcb_layer_stackup(ctx: Context) -> str:
     logger.info(f"Retrieved PCB layer stackup data")
     return json.dumps(stackup_data, indent=2)
 
-@mcp.tool()
+@_tool()
+async def create_pcb_rule(ctx: Context, rule_type: str, name: str, values: dict,
+                          scope1: str = "All", scope2: str = "All", comment: str = "",
+                          replace: bool = False, board_path: str = "") -> str:
+    """
+    Add a design rule to a PCB.
+
+    Values per rule_type, distances in mils:
+      clearance              gap_mils (between scope1 and scope2)
+      width                  min_mils, max_mils, preferred_mils (all signal layers)
+      hole_size              min_mils, max_mils
+      routing_via            min/max/preferred_diameter_mils,
+                             min/max/preferred_hole_mils
+      solder_mask_expansion  expansion_mils (negative shrinks the opening)
+      paste_mask_expansion   expansion_mils
+      polygon_connect        connect_style ("relief", "direct", "none"), and
+                             optionally conductor_width_mils, air_gap_mils,
+                             entries (2 or 4)
+
+    Scopes are Altium query expressions, e.g. "All", "InNet('GND')",
+    "InNetClass('Power')", "IsVia", "HasFootprint('0402')". A one-scope
+    rule (width, hole size, via, mask, ...) uses scope1 only.
+
+    PRIORITY: Altium makes a rule added this way priority 1, the highest
+    of its kind, and moves the others down; a script cannot set priority.
+    So a new rule wins wherever its scope applies. Give it a narrow scope
+    (a net, class or object kind), or reorder priorities in Altium's PCB
+    Rules and Constraints Editor afterwards. get_pcb_rules lists all rules
+    with their priorities. Check the result's "descriptor": it is what
+    Altium stored.
+
+    Args:
+        rule_type (str): One of the kinds above.
+        name (str): Rule name, unique on the board.
+        values (dict): The values for that kind, e.g. {"gap_mils": 8}.
+        scope1 (str): First (or only) object scope.
+        scope2 (str): Second scope, for two-object rules such as clearance.
+        comment (str): Optional rule comment.
+        replace (bool): Replace an existing rule of the same name instead
+            of refusing.
+        board_path (str): Full path of the .PcbDoc; empty for the focused
+            board, or the one the PCB tools last used.
+
+    Returns:
+        str: JSON with the rule's name, descriptor, scopes, priority and
+             whether it replaced an existing rule.
+    """
+    import pcb_rules
+
+    board_path = long_path(board_path)
+    encoded, error = pcb_rules.encode_values(rule_type, values)
+    if error:
+        return json.dumps({"success": False, "error": error})
+    if not name.strip():
+        return json.dumps({"success": False, "error": "name is empty"})
+    logger.info(f"Creating {rule_type} rule {name}")
+    response = await altium_bridge.execute_command("create_pcb_rule", {
+        "rule_kind": rule_type, "rule_name": name.strip(), "scope1": scope1 or "All",
+        "scope2": scope2 or "All", "comment": comment, "values": encoded,
+        "replace": bool(replace), "board_path": board_path})
+    if not response.get("success", False):
+        return json.dumps({"success": False,
+                           "error": f"Failed to create the rule: {response.get('error', 'unknown error')}"})
+    result = response.get("result", {})
+    if isinstance(result, str):
+        return result
+    others = result.get("other_rules_of_kind", 0)
+    if others and (scope1 or "All").strip().lower() == "all" and (scope2 or "All").strip().lower() == "all":
+        result["warning"] = (f"This rule applies to everything at priority 1, so it now overrides the "
+                             f"{others} other {rule_type} rule(s) on the board. Narrow its scope or "
+                             f"move it down in Altium's rules editor if that is not intended.")
+    return json.dumps(result, indent=2)
+
+# Changes the design: a timeout leaves its outcome unknown, so no blind retry
+MUTATING_COMMANDS.add("create_pcb_rule")
+
+@_tool(read_only=True)
 async def get_output_job_containers(ctx: Context, outjob_path: str = "") -> str:
     """
     Get all available output job containers from a specified OutJob file
@@ -3200,8 +5247,8 @@ async def get_output_job_containers(ctx: Context, outjob_path: str = "") -> str:
     logger.info(f"Retrieved output job containers data")
     return containers_data  # Already in JSON format
 
-@mcp.tool()
-async def get_outjob_settings(ctx: Context, outjob_path: str) -> str:
+@_tool(read_only=True)
+async def get_outjob_settings(ctx: Context, outjob_path: str, include_raw_settings: bool = False) -> str:
     """
     Read an .OutJob file from disk and return its outputs, containers and settings.
 
@@ -3217,16 +5264,20 @@ async def get_outjob_settings(ctx: Context, outjob_path: str) -> str:
 
     Args:
         outjob_path (str): Full path to the .OutJob file
+        include_raw_settings (bool): Also return raw_settings, the output's
+            settings as the file has them, for outputs with a decoded
+            summary. It doubles the reply. Outputs without a summary always
+            have raw_settings.
 
     Returns:
         str: JSON with path, group_name, variant, containers (name, type,
              output paths, file name expression, add_to_project) and outputs
              (type, name, document_path, variant, connected_containers and a
              decoded summary for Gerber, NC Drill, test points, pick and
-             place and print outputs, plus raw_settings)
+             place and print outputs, or sections by name for a BOM)
     """
     try:
-        data = parse_outjob(outjob_path)
+        data = parse_outjob(outjob_path, include_raw=include_raw_settings)
     except FileNotFoundError:
         return json.dumps({"error": f"OutJob not found: {outjob_path}"})
     except Exception as e:
@@ -3245,7 +5296,7 @@ async def _simple_command(command: str, params: dict, what: str) -> str:
     return result if isinstance(result, str) else json.dumps(result, indent=2, ensure_ascii=False)
 
 
-@mcp.tool()
+@_tool()
 async def open_project(ctx: Context, project_path: str) -> str:
     """Open and select an exact saved PrjPcb/LibPkg by absolute Windows path.
 
@@ -3260,7 +5311,7 @@ async def open_project(ctx: Context, project_path: str) -> str:
     return await project_selection.execute(altium_bridge, EXCHANGE_DIR, project_path, open_if_closed=True)
 
 
-@mcp.tool()
+@_tool()
 async def select_project(ctx: Context, project_path: str) -> str:
     """Select one exact already-open PrjPcb or LibPkg by absolute Windows path.
 
@@ -3277,7 +5328,7 @@ async def select_project(ctx: Context, project_path: str) -> str:
     return await project_selection.execute(altium_bridge, EXCHANGE_DIR, project_path)
 
 
-@mcp.tool()
+@_tool(read_only=True)
 async def get_project_info(ctx: Context) -> str:
     """
     Get the focused Altium project: parameters, documents and variants.
@@ -3296,29 +5347,58 @@ async def get_project_info(ctx: Context) -> str:
     return await _simple_command("get_project_info", {}, "project info")
 
 
-@mcp.tool()
-async def get_project_components(ctx: Context, include_parameters: bool = False) -> str:
+@_tool(read_only=True)
+async def get_project_components(ctx: Context, include_parameters: bool = False, designators: list = None,
+                                 sheet: str = "", offset: int = 0, limit: int = 0,
+                                 parameter_names: list = None) -> str:
     """
-    List every component of the compiled project (schematic side).
+    List the components of the compiled project (schematic side).
 
     Compiles the focused project in memory first (nothing is saved). Unlike
     the PCB component tools, this returns the schematic Comment of each
     instance, which is where values of generic passives usually live.
 
+    A large project does not fit in one reply. A reply stops at about 60,000
+    characters: when next_offset is not null, call again with
+    offset=next_offset and the same filters for the rest. Filter first when
+    you can: all parameters of every part can come to megabytes.
+
     Args:
         include_parameters (bool): Also return every component parameter
             (e.g. Manufacturer_Part_Number). Default False - the output is
             much larger with parameters.
+        designators (list): Only these designators. Wildcards work and case
+            does not matter, e.g. ["R*", "U1", "C1?"].
+        sheet (str): Only this sheet, by file name ("Power.SchDoc");
+            wildcards work.
+        offset (int): Skip this many matching components.
+        limit (int): At most this many components; 0 for as many as fit.
+        parameter_names (list): Return only these parameters, e.g.
+            ["Manufacturer_Part_Number"]. Implies include_parameters.
 
     Returns:
-        str: JSON with component_count and components [{designator, comment,
-             footprint, library_reference, sheet, parameters?}]
+        str: JSON with project_path, component_count (the whole project),
+             matched, offset, returned, next_offset and components
+             [{designator, comment, footprint, library_reference, sheet,
+             parameters?}]
     """
-    return await _simple_command("get_project_components",
-                                 {"include_parameters": include_parameters}, "project components")
+    import project_components
+
+    text = await _simple_command("get_project_components",
+                                 {"include_parameters": include_parameters or bool(parameter_names)},
+                                 "project components")
+    try:
+        data = json.loads(text, strict=False)
+    except ValueError:
+        return text
+    if "components" not in data:
+        return text
+    return project_components.compact_json(project_components.select(
+        data, designators=designators, sheet=sheet, offset=offset, limit=limit,
+        parameter_names=parameter_names))
 
 
-@mcp.tool()
+@_tool(read_only=True)
 async def get_erc_violations(ctx: Context, compile: bool = True) -> str:
     """
     Compile the focused project and list its ERC/compiler violations.
@@ -3337,7 +5417,7 @@ async def get_erc_violations(ctx: Context, compile: bool = True) -> str:
     return await _simple_command("get_erc_violations", {"compile": compile}, "ERC violations")
 
 
-@mcp.tool()
+@_tool(read_only=True)
 async def get_board_summary(ctx: Context) -> str:
     """
     Summarise the focused PCB for fabrication checks.
@@ -3355,7 +5435,7 @@ async def get_board_summary(ctx: Context) -> str:
     return await _simple_command("get_board_summary", {}, "board summary")
 
 
-@mcp.tool()
+@_tool(read_only=True)
 async def get_component_primitives(ctx: Context, designators: list) -> str:
     """
     List the primitives of PCB components with the layer each one is on.
@@ -3376,7 +5456,7 @@ async def get_component_primitives(ctx: Context, designators: list) -> str:
                                  "component primitives")
 
 
-@mcp.tool()
+@_tool()
 async def run_output_jobs(ctx: Context, container_names: list, outjob_path: str = "") -> str:
     """
     Run specified output job containers
@@ -3426,7 +5506,7 @@ async def run_output_jobs(ctx: Context, container_names: list, outjob_path: str 
     # Otherwise, convert to JSON
     return json.dumps(result_data, indent=2)
 
-@mcp.tool()
+@_tool()
 async def create_pcb_footprint(ctx: Context, footprint_name: str, description: str, pads: list, courtyard_x_mm: float = 0, courtyard_y_mm: float = 0) -> str:
     """
     Create a new PCB footprint in the currently active PcbLib document.
@@ -3436,6 +5516,7 @@ async def create_pcb_footprint(ctx: Context, footprint_name: str, description: s
                 shape options: Rect (default), Round, Oval
                 Coordinates are in mm relative to component origin (0,0).
                 Pin 1 is indicated by a gap in the top-left silkscreen corner.
+                Pads are created locked.
 
     Courtyard & silkscreen are auto-generated from pad extents + 0.25 mm margin
     unless courtyard_x_mm / courtyard_y_mm are provided explicitly (half-dimensions).
@@ -3472,13 +5553,14 @@ async def create_pcb_footprint(ctx: Context, footprint_name: str, description: s
     logger.info(f"Footprint {footprint_name} created successfully")
     return json.dumps(result, indent=2)
 
-@mcp.tool()
+@_tool(read_only=True)
 async def get_server_status(ctx: Context) -> str:
     """Read live server identity, startup source fingerprint and configured paths.
 
     Does not launch Altium or execute a script. altium_found and script_found
     only check file existence; they do not verify Altium scripting health.
     """
+    altium_bridge.config.discover_altium()
     status = {
         "server": "Running",
         **SERVER_INFO,
@@ -3503,12 +5585,10 @@ if __name__ == "__main__":
     script_dir = MCP_DIR / "AltiumScript"
     script_dir.mkdir(exist_ok=True)
     
-    # Verify configuration before starting
-    if not altium_bridge.config.verify_paths():
-        logger.warning("Configuration not complete. Some functionality may not work.")
-    
-    # Log status to stderr, leaving stdout for the MCP transport
-    logger.info(f"Altium executable: {altium_bridge.config.altium_exe_path}")
+    # Paths are verified, with a file dialog if need be, on the first command
+    # that needs Altium: a dialog here would hold up the client's initialize.
+    # Logged, not printed: under the stdio transport stdout is the protocol.
+    logger.info(f"Altium executable: {altium_bridge.config.altium_exe_path or '(not found yet)'}")
     logger.info(f"Script path: {altium_bridge.config.script_path}")
     
     # Run the server

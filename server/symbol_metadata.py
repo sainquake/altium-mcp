@@ -77,7 +77,7 @@ def prepare(symbol_name, description, pins, parameters, part_count=1, graphics=N
 
 
 def prepare_batch(spec_file):
-    """Validate every block before Altium opens a library or creates a symbol."""
+    """Preflight creation metadata while preserving upstream's library edits."""
     text(spec_file, "spec_file", True)
     lines = read_altium_text(spec_file).splitlines()
     current = None
@@ -85,21 +85,28 @@ def prepare_batch(spec_file):
     names = set()
     library_seen = False
     prepared_lines = []
+    block_count = 0
 
     def finish():
         if current is None:
             return
-        _, parameters = prepare(current["symbol_name"], current["description"], current["pins"],
-                                current["parameters"], current["part_count"], current["graphics"])
-        current["parameters"] = parameters
-        symbols.append(current)
+        prepared_lines.append(current["header"])
+        if current["mode"] == "SYMBOL":
+            _, parameters = prepare(current["symbol_name"], current["description"], current["pins"],
+                                    current["parameters"], current["part_count"], current["graphics"])
+            current["parameters"] = parameters
+            prepared_lines.extend(f"PARAM|{name}|{value}" for name, value in parameters.items())
+            if "final_description" in current:
+                validate(current["symbol_name"], current["final_description"], parameters)
+                current["description"] = current["final_description"]
+            symbols.append(current)
+        prepared_lines.extend(current["records"])
 
     for number, line in enumerate(lines, 1):
         if not line.strip():
             continue
         kind, _, rest = line.partition("|")
         kind = kind.strip().upper()
-        prepared_lines.append(kind + "|" + rest)
         try:
             if kind == "LIBRARY":
                 if library_seen or current is not None:
@@ -108,48 +115,77 @@ def prepare_batch(spec_file):
                 if not PureWindowsPath(path).is_absolute() or Path(path).suffix.lower() != ".schlib" or not Path(path).is_file():
                     raise ValueError("LIBRARY must be an absolute path to an existing .SchLib")
                 library_seen = True
-            elif kind == "SYMBOL":
+                prepared_lines.append(kind + "|" + rest)
+            elif kind in {"SYMBOL", "EDITSYMBOL"}:
                 finish()
                 fields = rest.split("|")
-                if len(fields) not in (2, 3):
+                if kind == "SYMBOL" and len(fields) not in (2, 3):
                     raise ValueError("expected SYMBOL|name|description[|part_count]; description cannot contain |")
-                name, description = fields[:2]
-                name = name.strip()
-                if name.casefold() in names:
+                if kind == "EDITSYMBOL" and len(fields) != 1:
+                    raise ValueError("expected EDITSYMBOL|name")
+                name = fields[0].strip()
+                text(name, "symbol name", True)
+                if kind == "SYMBOL" and name.casefold() in names:
                     raise ValueError(f"duplicate symbol name: {name}")
-                names.add(name.casefold())
-                current = {"symbol_name": name, "description": description,
+                if kind == "SYMBOL":
+                    names.add(name.casefold())
+                block_count += 1
+                current = {"mode": kind, "header": kind + "|" + rest, "records": [],
+                           "symbol_name": name, "description": fields[1] if kind == "SYMBOL" else "",
                            "part_count": int(fields[2]) if len(fields) == 3 and fields[2].strip() else 1,
-                           "parameters": {}, "pins": [], "graphics": []}
+                           "parameters": {}, "param_names": set(), "pins": [], "graphics": []}
             elif current is None:
                 raise ValueError("expected SYMBOL before component records")
             elif kind == "PARAM":
+                if current["mode"] != "SYMBOL":
+                    raise ValueError("PARAM belongs to SYMBOL; use SYMPARAM for EDITSYMBOL")
                 name, separator, value = rest.partition("|")
                 if not separator:
                     raise ValueError("expected PARAM|name|value")
-                if any(name.casefold() == existing.casefold() for existing in current["parameters"]):
+                if name.casefold() in current["param_names"]:
                     raise ValueError(f"duplicate parameter name: {name}")
-                current["parameters"][name] = value
+                current["param_names"].add(name.casefold())
+                current["parameters"][CANONICAL_NAMES.get(name.casefold(), name)] = value
             elif kind in {"PIN", "GRAPHIC"}:
+                if current["mode"] != "SYMBOL":
+                    raise ValueError(f"{kind} belongs only to SYMBOL")
                 current["pins" if kind == "PIN" else "graphics"].append(rest)
+                current["records"].append(kind + "|" + rest)
+            elif kind in {"COMMENT", "DESCRIPTION", "SYMPARAM", "PINPARAM", "PINDESC", "PINSYMBOL"}:
+                text(rest, kind)
+                current["records"].append(kind + "|" + rest)
+                if current["mode"] == "SYMBOL":
+                    if kind == "COMMENT":
+                        current["comment"] = rest.split("|", 1)[0]
+                    elif kind == "DESCRIPTION":
+                        current["final_description"] = rest
+                    elif kind == "SYMPARAM":
+                        fields = rest.split("|")
+                        if len(fields) < 3:
+                            raise ValueError("expected SYMPARAM|name|value|visible[|x|y|justification|font]")
+                        name, value = fields[:2]
+                        name = CANONICAL_NAMES.get(name.casefold(), name)
+                        # SYMPARAM replaces existing values, as upstream does.
+                        existing = next((key for key in current["parameters"] if key.casefold() == name.casefold()), name)
+                        current["parameters"][existing] = value
             else:
                 raise ValueError(f"unknown record: {kind}")
         except (ValueError, TypeError) as exc:
             raise ValueError(f"line {number}: {exc}") from exc
     finish()
-    if not symbols:
-        raise ValueError("batch must contain at least one SYMBOL")
+    if not block_count:
+        raise ValueError("batch must contain at least one SYMBOL or EDITSYMBOL")
     return "\n".join(prepared_lines) + "\n", symbols
 
 
-def verify(result, description, parameters):
+def verify(result, description, parameters, comment=None):
     """Compare Altium readback to the request, including the native Description."""
     metadata = result.get("metadata", {})
     actual = {name.casefold(): value for name, value in metadata.get("parameters", {}).items()}
     errors = [f"parameter mismatch: {name}" for name, value in parameters.items() if actual.get(name.casefold()) != value]
     if metadata.get("description") != description:
         errors.append("native Description mismatch")
-    if metadata.get("comment") != parameters["MP"]:
+    if metadata.get("comment") != (parameters["MP"] if comment is None else comment):
         errors.append("Comment mismatch")
     result["verification"] = {"passed": not errors, "errors": errors}
     if errors:

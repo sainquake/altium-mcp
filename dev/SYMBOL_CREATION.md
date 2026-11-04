@@ -35,6 +35,8 @@ parameter dictionary; the existing required core fields still apply.
 `Designator` and `Description` cannot be supplied as custom parameters. Comment
 is set to MP and hidden; Value is visible below the symbol, while other custom
 parameters are hidden and shared across symbol parts. No document is saved.
+Explicit upstream batch records such as `COMMENT` and `SYMPARAM` can override
+these presentation defaults; verification uses the requested final values.
 
 ## Searchable Description
 
@@ -78,6 +80,15 @@ create_schematic_symbol(
 The example data is illustrative. Replace it with actual component data.
 
 ## Batch creation
+
+Upstream's `EDITSYMBOL`, `COMMENT`, `DESCRIPTION`, `SYMPARAM`, `PINPARAM`,
+`PINDESC` and `PINSYMBOL` records are supported alongside `PARAM`. Existing-symbol
+edit blocks do not require the creation metadata schema and never create a
+missing symbol. In creation blocks, `SYMPARAM` values can supply required
+metadata, with the same validation as `PARAM`. Metadata readback occurs after
+all property edits. Results retain upstream's `edited`, `failed` and `problems`
+fields, plus the fork's creation verification. A batch with reported problems
+does not claim success.
 
 Add a complete set of `PARAM|name|value` records for **each** symbol:
 

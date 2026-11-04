@@ -18,6 +18,7 @@ try:
     from mcp import ClientSession
     from mcp.server.fastmcp import FastMCP, Context
     from mcp.shared.memory import create_client_server_memory_streams
+    from mcp.types import ToolAnnotations
 except ImportError:
     FastMCP = None
 
@@ -69,12 +70,14 @@ class ServerInfoTest(unittest.TestCase):
             if isinstance(node, ast.Assign):
                 target = node.targets[0]
                 if isinstance(target, ast.Name) and target.id in (
-                    "SERVER_INFO", "SERVER_STARTED_MONOTONIC", "mcp"
+                    "SERVER_INFO", "SERVER_STARTED_MONOTONIC", "mcp", "READ_ONLY"
                 ):
                     if protocol or target.id != "mcp":
                         selected.append(node)
                 elif protocol and isinstance(target, ast.Attribute) and target.attr == "version":
                     selected.append(node)
+            elif protocol and isinstance(node, ast.FunctionDef) and node.name == "_tool":
+                selected.append(node)
             elif isinstance(node, ast.AsyncFunctionDef) and node.name == "get_server_status":
                 if not protocol:
                     node.decorator_list = []
@@ -82,8 +85,10 @@ class ServerInfoTest(unittest.TestCase):
         scope = {"capture_runtime_info": lambda: capture_runtime_info(self.root),
                  "time": time, "json": json, "os": os, "AGENT_INSTRUCTIONS": "",
                  "FastMCP": FastMCP, "Context": Context if FastMCP else object,
+                 "ToolAnnotations": ToolAnnotations if FastMCP else None,
                  "altium_bridge": SimpleNamespace(config=SimpleNamespace(
-                     altium_exe_path=str(self.root / "missing.exe"), script_path=str(self.metadata)))}
+                     altium_exe_path=str(self.root / "missing.exe"), script_path=str(self.metadata),
+                     discover_altium=lambda: False))}
         exec(compile(ast.Module(body=selected, type_ignores=[]), "server_status", "exec"), scope)
         return scope
 

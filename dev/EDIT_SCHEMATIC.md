@@ -1,11 +1,35 @@
-# edit_schematic(sheet_path, operations)
+# edit_schematic(sheet_path, operations, unit="mil", save=False)
 
-Adds, updates and deletes objects on an existing Altium schematic in memory.
-Never saves documents or clears Modified. A sheet may retain its `*` marker
+The UID operation format below adds, updates and deletes objects in memory.
+It always uses mils and requires `save=False`; it never clears Modified. A sheet may retain its `*` marker
 after test objects have been removed.
 
 `build_schematic` creates a new sheet. Use `edit_schematic` with an exact path
 to continue working on an existing sheet.
+
+## Upstream action format
+
+The same tool also accepts `move_component`, `delete_component`,
+`place_component`, `set_parameter`, `move_text`, `add_wire`, `add_net_label`,
+`add_power_port`, `add_junction`, `add_no_erc` and `delete_at` operations.
+These accept `unit="mil"` or `unit="mm"` and optional `save=True`, preserving
+upstream's interface for applying `check_schematic` suggestions. For example:
+
+```python
+edit_schematic(
+    sheet_path=r"C:\Projects\Board\Display.SchDoc",
+    operations=[{"op": "move_component", "designator": "R1", "x": 20, "y": 30}],
+    unit="mm",
+    save=False,
+)
+```
+
+Action operations run in order in one undo group; inspect `errors` for partial
+failures. UID operations preflight all targets and report `applied_count`,
+`failed_index` and `may_have_partial_changes`. Do not mix formats in a batch.
+An empty list continues to read objects and UIDs. Use `save_document` to save
+after UID edits. Both formats isolate request files and retain uncertain inputs
+after a bridge timeout; inspect the document before retrying.
 
 ## Reading and targeting
 

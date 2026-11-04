@@ -1,4 +1,4 @@
-﻿[Design]
+[Design]
 Version=1.0
 HierarchyMode=0
 ChannelRoomNamingStyle=0
@@ -133,11 +133,11 @@ DItemRevisionGUID=
 GenerateClassCluster=0
 DocumentUniqueId=
 
-[Document10]
+[Document6]
 DocumentPath=document_management.pas
 AnnotationEnabled=1
 
-[Document9]
+[Document7]
 DocumentPath=library_component_data.pas
 AnnotationEnabled=1
 
@@ -145,12 +145,29 @@ AnnotationEnabled=1
 DocumentPath=schematic_connectivity.pas
 AnnotationEnabled=1
 
-[Document7]
+[Document9]
 DocumentPath=schematic_editor.pas
 AnnotationEnabled=1
 
-[Document6]
+[Document10]
 DocumentPath=json_utils.pas
+AnnotationEnabled=1
+AnnotateStartValue=1
+AnnotationIndexControlEnabled=0
+AnnotateSuffix=
+AnnotateScope=All
+AnnotateOrder=-1
+DoLibraryUpdate=1
+DoDatabaseUpdate=1
+ClassGenCCAutoEnabled=1
+ClassGenCCAutoRoomEnabled=0
+ClassGenNCAutoScope=None
+DItemRevisionGUID=
+GenerateClassCluster=0
+DocumentUniqueId=
+
+[Document11]
+DocumentPath=silk_autoplacer.pas
 AnnotationEnabled=1
 AnnotateStartValue=1
 AnnotationIndexControlEnabled=0

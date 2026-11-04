@@ -171,6 +171,26 @@ class SymbolMetadataTest(unittest.TestCase):
             with self.subTest(field=field):
                 self.assertFalse(data.verify(result, DESCRIPTION, PARAMETERS)["success"])
 
+    def test_edit_only_batch_and_native_failures_keep_upstream_results(self):
+        path = self.batch("EDITSYMBOL|EXISTING\nPINDESC|1|Input pin\n")
+
+        async def execute(command, params):
+            self.assertIn("EDITSYMBOL|EXISTING", read_altium_text(params["spec_file"]))
+            return {"success": True, "result": {"created": 0, "edited": 1, "failed": [], "problems": []}}
+
+        tool, bridge = self.tool("create_symbols_batch", execute)
+        result = json.loads(asyncio.run(tool(None, str(path))))
+        self.assertTrue(result["success"])
+        self.assertEqual(result["edited"], 1)
+        bridge.execute_command.side_effect = None
+        bridge.execute_command.return_value = {"success": False, "error": "native operation failed",
+            "result": {"success": False, "created": 0, "edited": 0, "failed": ["EXISTING"],
+                       "problems": ["EXISTING: pin not found"]}}
+        result = json.loads(asyncio.run(tool(None, str(path))))
+        self.assertFalse(result["success"])
+        self.assertEqual(result["failed"], ["EXISTING"])
+        self.assertEqual(result["problems"], ["EXISTING: pin not found"])
+
 
 if __name__ == "__main__":
     unittest.main()
