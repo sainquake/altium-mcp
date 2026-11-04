@@ -642,7 +642,7 @@ begin
 
     // Refresh library
     CurrentLib.GraphicallyInvalidate;
-    if ClientDoc <> nil then ClientDoc.SetModified(True);
+    if ClientDoc <> nil then ClientDoc.Modified := True;
 
     // Create result JSON
     ResultProps := TStringList.Create;

@@ -25,6 +25,12 @@ does not invent values. Names match case-insensitively and use the spelling abov
 when stored. Additional string parameters are allowed, up to 500 total.
 JLCPCB/LCSC fields are optional. Duplicate names are rejected.
 
+Use [`get_lcsc_component_info`](LCSC_COMPONENT_DATA.md) to obtain catalog data.
+After creation, `set_library_component_lcsc_data(library_path, symbol_name,
+lcsc_id, qty=1)` fills only supplier fields after checking the symbol's MP.
+Alternatively, merge the chosen card's `lcsc_parameters` into the creation
+parameter dictionary; the existing required core fields still apply.
+
 `Pacage` and `Pacage Metric` are rejected; use `Package`. Built-in `Comment`,
 `Designator` and `Description` cannot be supplied as custom parameters. Comment
 is set to MP and hidden; Value is visible below the symbol, while other custom

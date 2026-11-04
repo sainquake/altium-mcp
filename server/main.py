@@ -32,6 +32,7 @@ import library_component_data
 import symbol_metadata
 import document_management
 import project_selection
+import lcsc_catalog
 from server_info import capture_runtime_info
 
 # Freeze source identity before serving requests, even if files are later updated.
@@ -1933,6 +1934,58 @@ async def get_schematic_connectivity(ctx: Context, sheet_path: str, compiled: bo
 
 
 @mcp.tool()
+async def get_lcsc_component_info(ctx: Context, query: str, qty: int = 1, limit: int = 5) -> str:
+    """Read LCSC chip/component data by C-number, MPN or search text; no Altium needed.
+
+    Returns detail cards: identity, manufacturer, category, description, package,
+    all catalog technical parameters with original names/units, datasheet/product
+    links, stock, MOQ, USD price breaks and quantity pricing. Exact MPN matches
+    are preferred when present; ambiguous candidates remain explicit results.
+    qty is positive; limit is 1..10. No ranking, alternatives, jobs or disk cache.
+    Each card includes lcsc_parameters ready to merge into symbol creation.
+    Unknown stock/MOQ/prices remain null (empty strings in library fields).
+    Uses the source toolkit's undocumented public-web endpoints; schema/network
+    errors are reported without guessed data. Stock/prices are timestamped snapshots.
+    """
+    try:
+        result = await asyncio.to_thread(lcsc_catalog.LcscClient().lookup, query, qty, limit)
+        return json.dumps(result, indent=2, ensure_ascii=False)
+    except (ValueError, TypeError, lcsc_catalog.LcscError) as exc:
+        return json.dumps({"success": False, "error": str(exc), "saved": False}, ensure_ascii=False)
+
+
+@mcp.tool()
+async def set_library_component_lcsc_data(ctx: Context, library_path: str, symbol_name: str,
+                                         lcsc_id: str, qty: int = 1) -> str:
+    """Fill LCSC/JLCPCB fields on an exact existing SchLib symbol after creation.
+
+    Fetches a fresh detail card for an exact C-number, then requires the symbol's
+    MP to match that card's MPN (case-insensitive). Upserts only supplier fields
+    through set_library_component_data, with its native preflight and readback.
+    Does not change core parameters, Comment, native Description, models or geometry;
+    never creates Pacage, edits placed components or saves a document. Repeated
+    identical data reuses the fields. Do not edit the symbol concurrently.
+    """
+    try:
+        lcsc_id = lcsc_catalog.validate_code(lcsc_id)
+        lcsc_catalog.validate_quantity(qty)
+        library_component_data.prepare_request(library_path, symbol_name, None, None, None, None)
+        component = await asyncio.to_thread(lcsc_catalog.LcscClient().get_product, lcsc_id, qty)
+        current = json.loads(await set_library_component_data(ctx, library_path, symbol_name))
+        if not current.get("success"):
+            return json.dumps(current, ensure_ascii=False)
+        lcsc_catalog.check_target(current["after"], component)
+        parameters = lcsc_catalog.library_parameters(component)
+    except (ValueError, TypeError, OSError, lcsc_catalog.LcscError) as exc:
+        return json.dumps({"success": False, "error": str(exc), "saved": False, "may_have_partial_changes": False}, ensure_ascii=False)
+    result = json.loads(await set_library_component_data(ctx, library_path, symbol_name, parameters=parameters))
+    result["lcsc_id"] = component["lcsc_id"]
+    result["lcsc_fetched_at"] = component["fetched_at"]
+    result["lcsc_parameter_names"] = list(parameters)
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
 async def set_library_component_data(ctx: Context, library_path: str, symbol_name: str,
                                      parameters: Optional[dict] = None, footprint_models: Optional[list] = None,
                                      comment: Optional[str] = None, description: Optional[str] = None) -> str:
@@ -1972,6 +2025,8 @@ async def set_library_component_data(ctx: Context, library_path: str, symbol_nam
                 library_component_data.enrich(result[key])
         if result.get("success"):
             errors = library_component_data.verify(result["after"], parameters, footprint_models, comment, description)
+            if result.get("changed") and result.get("is_modified") is not True:
+                errors.append("library is not marked Modified after metadata edits")
             result["verification"] = {"passed": not errors, "errors": errors}
             if errors:
                 result.update(success=False, error="library metadata readback mismatch", may_have_partial_changes=result["changed"])

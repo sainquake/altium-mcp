@@ -529,10 +529,11 @@ begin
         begin
             SchServer.ProcessControl.PostProcess(Lib, '');
             Editing := False;
-            ClientDoc.SetModified(True);
             Lib.GraphicallyInvalidate;
         end;
         Client.ShowDocument(ClientDoc);
+        // SetModified can be ignored for metadata-only/empty symbols.
+        if Started then MarkDocumentModified(Path);
         AfterState := LibraryComponentSnapshot(Comp);
         Props := TStringList.Create;
         try

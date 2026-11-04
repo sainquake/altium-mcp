@@ -135,6 +135,16 @@ class LibraryDataTest(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertTrue(result["may_have_partial_changes"])
         self.assertFalse(list(Path(self.temp.name).glob("library_data_*.txt")))
+        for modified in (False, True):
+            before = self.snapshot()
+            before["parameters"]["MP"] = "PREVIOUS"
+            bridge.execute_command.return_value = {"success": True, "result": {
+                "success": True, "changed": True, "is_modified": modified,
+                "before": before, "after": self.snapshot()}}
+            result = json.loads(asyncio.run(tool(None, str(self.sch), "TEST", parameters={"MP": "ABC"})))
+            self.assertEqual(result["success"], modified)
+            if not modified:
+                self.assertIn("Modified", " ".join(result["verification"]["errors"]))
         bridge.execute_command.reset_mock()
         result = json.loads(asyncio.run(tool(None, str(self.sch), "TEST", parameters={"bad": 2})))
         self.assertFalse(result["success"])
