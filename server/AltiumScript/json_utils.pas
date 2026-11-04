@@ -23,6 +23,9 @@ end;
 
 // Helper function to escape JSON strings
 function JSONEscapeString(const S: String): String;
+var
+    Escaped: String;
+    I: Integer;
 begin
     Result := StringReplace(S, '\', '\\', REPLACEALL);
     Result := StringReplace(Result, '"', '\"', REPLACEALL);
@@ -30,6 +33,15 @@ begin
     Result := StringReplace(Result, #10, '\n', REPLACEALL);
     Result := StringReplace(Result, #13, '\n', REPLACEALL);
     Result := StringReplace(Result, #9, '\t', REPLACEALL);
+    // SaveToFile writes the ANSI code page. Keep JSON lossless on every locale,
+    // including schematic snapshots and upstream tool results.
+    Escaped := Result;
+    Result := '';
+    for I := 1 to Length(Escaped) do
+        if Ord(Escaped[I]) > 127 then
+            Result := Result + '\u' + IntToHex(Ord(Escaped[I]), 4)
+        else
+            Result := Result + Escaped[I];
 end;
 
 // Function to create a JSON name-value pair

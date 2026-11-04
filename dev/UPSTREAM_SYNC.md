@@ -6,7 +6,7 @@ Upstream contributes 119 commits; the fork contributes 11.
 
 ## Branches and commands
 
-The original fork main is preserved by both `main` and the local backup branch
+The original fork main is preserved by the local backup branch
 `codex/backup-before-upstream-2026-11-04`. Integration takes place on
 `codex/sync-upstream-v0.6.1`.
 
@@ -67,8 +67,40 @@ batch metadata/readback and the actual server's stdio initialization. The
 merged server exposes 70 tools and returns its runtime identity without
 duplicating string responses as structured content.
 
-Live Altium editing and saving have not been exercised for this merge. Offline
-tests and bundling do not establish DelphiScript compilation or document-edit
-behavior in a running Altium instance. Use disposable design/library copies
-for the existing `dev/test_*_live.py` harnesses before relying on the merged
-version for production work.
+Live validation on Altium Designer 24 completed 47 steps on a generated project
+and library copies using [test_upstream_merge_live.py](test_upstream_merge_live.py).
+It covered both editor formats, metric actions and saving, compiler/cached
+connectivity, filtered project components, symbol creation, mixed create/edit
+batches, footprint creation, verified model links, exact document lifecycle,
+PCB layers/stackup, via placement, rule creation/readback and DRC. The source
+hashes and timestamps of 19 inputs and the original project's document states
+remained unchanged, including an already modified source sheet.
+
+Live tests found an ANSI response-encoding defect: Greek characters in schematic
+parameter readback became `?`. JSON string values now escape non-ASCII UTF-16
+code units before the bridge writes the response. Both editor formats passed
+the Unicode round-trip after this fix. The harness retains this regression.
+
+The copied production design reported five floating-input compiler errors and
+one pin missing from the compiler model; retrieval returned these limitations
+explicitly. The separate scratch PCB's DRC correctly reported the deliberately
+unconnected test via. These are checks of tool behavior, not a design sign-off.
+
+Local evidence is stored in `.altium-mcp/upstream_live_20261104_184744/report.json`
+and its per-step JSON files. Design copies and detailed diagnostics are excluded
+from Git. Standard stdio initialization also passed with 70 tools under MCP
+1.30.0.
+
+## Promoting the validated integration
+
+The integration fixes and validation harness are committed on the integration
+branch first. Then advance main without rewriting existing history:
+
+```powershell
+git switch main
+git merge --ff-only codex/sync-upstream-v0.6.1
+git push origin main
+```
+
+`--ff-only` requires main to be an ancestor of the tested integration. If another
+change has diverged from it, Git stops instead of silently creating a new merge.
