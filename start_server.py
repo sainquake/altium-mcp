@@ -205,6 +205,13 @@ def _release_lock():
 
 # --- builder ----------------------------------------------------------------
 
+def _background_subprocess_options():
+    """Keep non-interactive child processes from opening Windows consoles."""
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
+
+
 def _build_venv():
     # An existing tree here is a partial build or one whose requirements moved.
     # Either way it cannot be trusted. Removing it first is what stops
@@ -216,18 +223,20 @@ def _build_venv():
                 "Could not remove the existing virtual environment at %s. "
                 "Something is holding it open." % VENV_DIR
             )
-    subprocess.check_call([sys.executable, "-m", "venv", str(VENV_DIR)])
+    subprocess.check_call([sys.executable, "-m", "venv", str(VENV_DIR)],
+                          **_background_subprocess_options())
     pip = [str(VENV_DIR / "Scripts" / "pip.exe"), "install", "--quiet"]
     installed = False
     if _locked_text():
         # Hashes in the file put pip in hash-checking mode for every package.
         try:
-            subprocess.check_call(pip + ["-r", str(LOCKED_REQUIREMENTS)])
+            subprocess.check_call(pip + ["-r", str(LOCKED_REQUIREMENTS)],
+                                  **_background_subprocess_options())
             installed = True
         except subprocess.CalledProcessError as exc:
             print("locked install failed (%s); falling back to %s" % (exc, REQUIREMENTS))
     if not installed:
-        subprocess.check_call(pip + REQUIREMENTS)
+        subprocess.check_call(pip + REQUIREMENTS, **_background_subprocess_options())
     MARKER.write_text(_marker_payload(), encoding="utf-8")
     _prune_old_venvs()
 
@@ -350,7 +359,7 @@ def build_main():
 def _spawn_builder():
     """Start the builder detached from this process, its console and its job."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    cmd = [sys.executable, str(Path(__file__).resolve()), "--build"]
+    cmd = [sys.executable, "-u", str(Path(__file__).resolve()), "--build"]
     log = open(BUILD_LOG, "a", encoding="utf-8", errors="replace")
     log.write("\n=== %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
     log.flush()
@@ -478,7 +487,10 @@ def main(argv=None):
     # main.py keeps config.json in the same per-user folder; hand it the
     # resolved location so the two can never disagree.
     env = dict(os.environ, ALTIUM_MCP_HOME=str(DATA_DIR))
-    return subprocess.call([venv_python, server_path], env=env)
+    # Hidden Windows children need explicit pipe handles for MCP stdio.
+    return subprocess.call([venv_python, server_path], env=env,
+                           stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr,
+                           **_background_subprocess_options())
 
 
 if __name__ == "__main__":
