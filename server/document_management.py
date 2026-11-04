@@ -49,7 +49,9 @@ def prepare(action, document_path, document_kind=None, project_path=None, dry_ru
     path = absolute_path(document_path, KINDS)
     kind = KINDS[path.suffix.lower()]
     spec = {"document_path": str(path), "document_kind": kind}
-    if action == "create_document":
+    if action == "open_document":
+        pass  # Native code checks existence only when the exact file is not open.
+    elif action == "create_document":
         if document_kind is not None and (not isinstance(document_kind, str) or document_kind.upper() != kind):
             raise ValueError("document_kind must match the filename extension (SCH, PCB, SCHLIB or PCBLIB)")
         writable_local_path(path)
@@ -108,6 +110,21 @@ async def execute(bridge, exchange_dir, action, document_path, **options):
                               "exists": path.is_file(), "size_bytes": path.stat().st_size if path.is_file() else None}
             if result.get("success") and (not result.get("saved") or not after or not path.stat().st_size or result.get("is_modified")):
                 result.update(success=False, error="save readback failed", may_have_partial_changes=True)
+        if action == "open_document" and result.get("success"):
+            errors = []
+            if PureWindowsPath(result.get("document_path", "")) != PureWindowsPath(str(path)) or result.get("document_kind") != spec["document_kind"]:
+                errors.append("opened document identity mismatch")
+            if result.get("focused") is not True or PureWindowsPath(result.get("active_document_path", "")) != PureWindowsPath(str(path)):
+                errors.append("active editor does not match the requested document")
+            if result.get("saved") is not False:
+                errors.append("opening must not save")
+            if type(result.get("already_open")) is not bool or result.get("opened") is not (not result.get("already_open")):
+                errors.append("document open/reuse readback is incomplete")
+            if result.get("already_open") and result.get("was_modified") != result.get("is_modified"):
+                errors.append("opening changed Modified on an existing document")
+            result["verification"] = {"passed": not errors, "errors": errors}
+            if errors:
+                result.update(success=False, error="document open readback failed", may_have_partial_changes=True)
         return json.dumps(result, indent=2, ensure_ascii=False)
     finally:
         if response and response.get("success"):

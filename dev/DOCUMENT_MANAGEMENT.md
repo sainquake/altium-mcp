@@ -13,6 +13,7 @@ The following tools now cover explicit file creation, saving and project inclusi
 | Tool | Behavior |
 | --- | --- |
 | `create_document(document_path, document_kind=None)` | Create a named document in Free Documents, without writing a file. |
+| `open_document(document_path)` | Open/focus an existing document, reusing it without reloading when already open. |
 | `save_document(document_path, dry_run=False)` | Save only that exact open document to its assigned filename. |
 | `add_document_to_project(project_path, document_path)` | Include one document in one exact open project, without saving either. |
 
@@ -64,6 +65,14 @@ or an open named unsaved document. Repeating inclusion returns `changed=false`
 without adding another entry. Other projects and unrelated memberships are kept.
 No compile or automatic save occurs. Use Altium's project save command when the
 user later requests persistence of membership.
+
+[`open_project(project_path)`](OPEN_TARGETS.md) opens a closed existing PrjPcb or
+LibPkg and selects it. This differs from adding a source document to a project.
+The same guide covers opening SchLib/PcbLib libraries through `open_document`.
+
+To make an already-open project current for project-level inspection, use
+[`select_project(project_path)`](PROJECT_SELECTION.md). Inclusion itself does
+not select a project. Selection does not save a project or its documents.
 
 ## Results and failures
 

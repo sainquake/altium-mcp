@@ -31,6 +31,7 @@ import schematic_connectivity
 import library_component_data
 import symbol_metadata
 import document_management
+import project_selection
 from server_info import capture_runtime_info
 
 # Freeze source identity before serving requests, even if files are later updated.
@@ -1981,6 +1982,22 @@ async def set_library_component_data(ctx: Context, library_path: str, symbol_nam
 
 
 @mcp.tool()
+async def open_document(ctx: Context, document_path: str) -> str:
+    """Open/focus an exact existing SchDoc/PcbDoc/SchLib/PcbLib by absolute path.
+
+    Use this to open a symbol or footprint library without a search/read side
+    operation. Reuses an already-open document, including named unsaved files,
+    without reloading it or clearing Modified. A closed target must exist on
+    disk; missing files fail rather than creating a blank document. Never saves,
+    compiles, installs a library or adds project membership. Returns opened,
+    already_open, exact identity, Modified state and verification. Showing a
+    document may change the current project to its owner; use select_project
+    separately when project context matters.
+    """
+    return await document_management.execute(altium_bridge, EXCHANGE_DIR, "open_document", document_path)
+
+
+@mcp.tool()
 async def create_document(ctx: Context, document_path: str, document_kind: Optional[str] = None) -> str:
     """Create a named unsaved document in Free Documents; never saves or adds it to a project.
 
@@ -3171,6 +3188,38 @@ async def _simple_command(command: str, params: dict, what: str) -> str:
         return json.dumps({"error": f"Failed to get {what}: {error_msg}"})
     result = response.get("result", {})
     return result if isinstance(result, str) else json.dumps(result, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+async def open_project(ctx: Context, project_path: str) -> str:
+    """Open and select an exact saved PrjPcb/LibPkg by absolute Windows path.
+
+    Reuses an already-open project instead of reopening it. A closed target must
+    exist on disk; missing paths fail without creating a project. Verifies the
+    exact current project and preservation of preexisting document open/Modified
+    states. Never saves, compiles, closes existing projects/documents or rewrites
+    memberships. Altium may restore source tabs when loading a closed project.
+    Use select_project when the project is already open and opening is unwanted.
+    A bridge failure may have opened/selected the target; inspect before retrying.
+    """
+    return await project_selection.execute(altium_bridge, EXCHANGE_DIR, project_path, open_if_closed=True)
+
+
+@mcp.tool()
+async def select_project(ctx: Context, project_path: str) -> str:
+    """Select one exact already-open PrjPcb or LibPkg by absolute Windows path.
+
+    Uses Altium's current-project API; does not open a sheet to infer its owner.
+    Never opens a closed project, opens/closes/reloads documents, compiles, saves,
+    changes project membership or clears Modified. Works for empty open projects.
+    Repeated selection is idempotent (changed=false). Returns previous/current
+    project paths, before/after document states and readback verification.
+    The active editor tab is independent: board/library editing tools retain
+    their own document targeting rules. Closed/ambiguous paths fail without
+    selecting a different project; available_project_paths lists open targets.
+    A bridge timeout may have changed focus; inspect it before continuing.
+    """
+    return await project_selection.execute(altium_bridge, EXCHANGE_DIR, project_path)
 
 
 @mcp.tool()

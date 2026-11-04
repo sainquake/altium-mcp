@@ -55,8 +55,8 @@ var
     Spec, Props: TStringList;
     Doc: IServerDocument;
     Project: IProject;
-    Path, Kind, ProjectPath, ErrorText: String;
-    Started, Saved, WasModified, Changed, DryRun: Boolean;
+    Path, Kind, ProjectPath, ErrorText, PreviousDocumentPath, ActiveDocumentPath: String;
+    Started, Saved, WasModified, Changed, DryRun, AlreadyOpen, Opened: Boolean;
     BeforeCount, AfterCount, I, Membership: Integer;
 begin
     Result := 'ERROR: document spec file not found';
@@ -67,6 +67,10 @@ begin
     Saved := False;
     Changed := False;
     WasModified := False;
+    AlreadyOpen := False;
+    Opened := False;
+    PreviousDocumentPath := '';
+    ActiveDocumentPath := '';
     Doc := nil;
     Project := nil;
     ErrorText := '';
@@ -85,13 +89,44 @@ begin
             if not DirectoryExists(ExtractFilePath(Path)) then
                 begin ErrorText := 'parent directory does not exist'; Break; end;
             Doc := FindOpenDocument(Path);
+            AlreadyOpen := Doc <> nil;
             if Doc <> nil then
             begin
                 if (NormalizedPath(Doc.FileName) <> NormalizedPath(Path)) or (UpperCase(Doc.Kind) <> Kind) then
                     begin ErrorText := 'open document identity does not match requested path and kind'; Break; end;
                 WasModified := Doc.Modified;
             end;
-            if Action = 'create_document' then
+            if Action = 'open_document' then
+            begin
+                if Client.CurrentView <> nil then
+                    if Client.CurrentView.OwnerDocument <> nil then
+                        PreviousDocumentPath := Client.CurrentView.OwnerDocument.FileName;
+                if Doc = nil then
+                begin
+                    if not FileExists(Path) then
+                        begin ErrorText := 'closed document must exist on disk; no document was created'; Break; end;
+                    LogScriptError('open_document: open exact document ' + Path);
+                    Started := True;
+                    Doc := Client.OpenDocument(Kind, Path);
+                    if Doc = nil then begin ErrorText := 'Altium did not open the document'; Break; end;
+                    Opened := True;
+                end;
+                if (NormalizedPath(Doc.FileName) <> NormalizedPath(Path)) or (UpperCase(Doc.Kind) <> Kind) then
+                    begin ErrorText := 'opened document identity mismatch'; Break; end;
+                if Doc.BeingClosed then begin ErrorText := 'document is closing'; Break; end;
+                Started := True;
+                Client.ShowDocument(Doc);
+                Sleep(100);
+                if Client.CurrentView <> nil then
+                    if Client.CurrentView.OwnerDocument <> nil then
+                        ActiveDocumentPath := Client.CurrentView.OwnerDocument.FileName;
+                if NormalizedPath(ActiveDocumentPath) <> NormalizedPath(Path) then
+                    begin ErrorText := 'active editor document readback mismatch'; Break; end;
+                if AlreadyOpen and (WasModified <> Doc.Modified) then
+                    begin ErrorText := 'opening changed Modified on an existing document'; Break; end;
+                Changed := Opened or (NormalizedPath(PreviousDocumentPath) <> NormalizedPath(ActiveDocumentPath));
+            end
+            else if Action = 'create_document' then
             begin
                 if FileExists(Path) or (Doc <> nil) then
                     begin ErrorText := 'create_document refuses an existing file or open document'; Break; end;
@@ -169,6 +204,14 @@ begin
             AddJSONBoolean(Props, 'is_modified', Doc.Modified);
         end;
         if Action = 'save_document' then AddJSONBoolean(Props, 'dry_run', DryRun);
+        if Action = 'open_document' then
+        begin
+            AddJSONBoolean(Props, 'already_open', AlreadyOpen);
+            AddJSONBoolean(Props, 'opened', Opened);
+            AddJSONProperty(Props, 'previous_document_path', PreviousDocumentPath);
+            AddJSONProperty(Props, 'active_document_path', ActiveDocumentPath);
+            AddJSONBoolean(Props, 'focused', NormalizedPath(ActiveDocumentPath) = NormalizedPath(Path));
+        end;
         if Action = 'add_document_to_project' then
         begin
             AddJSONProperty(Props, 'project_path', ProjectPath);
@@ -193,6 +236,250 @@ begin
         if Pos('"spec_file":', Request[I]) > 0 then
         begin
             Result := ManageDocument(Action, JSONLineValue(Request[I]));
+            Exit;
+        end;
+end;
+
+// Project selection uses IProject directly; editor tabs remain independent.
+function SelectionDocumentStates(Project: IProject): String;
+var
+    Items, Props: TStringList;
+    Source: IDocument;
+    OpenDoc: IServerDocument;
+    I: Integer;
+    State: String;
+begin
+    Items := TStringList.Create;
+    try
+        for I := 0 to Project.DM_LogicalDocumentCount - 1 do
+        begin
+            Source := Project.DM_LogicalDocuments(I);
+            OpenDoc := FindOpenDocument(Source.DM_FullPath);
+            State := 'closed';
+            if OpenDoc <> nil then
+            begin
+                State := 'open';
+                if OpenDoc.Modified then State := 'modified';
+            end;
+            Props := TStringList.Create;
+            try
+                AddJSONProperty(Props, 'path', Source.DM_FullPath);
+                AddJSONProperty(Props, 'kind', Source.DM_DocumentKind);
+                AddJSONProperty(Props, 'state', State);
+                Items.Add(BuildJSONObject(Props));
+            finally
+                Props.Free;
+            end;
+        end;
+        Result := BuildJSONArray(Items);
+    finally
+        Items.Free;
+    end;
+end;
+
+procedure ExistingOpenDocumentPaths(Paths: TStringList);
+var
+    I, J: Integer;
+    Module: IServerModule;
+    Path: String;
+begin
+    for I := 0 to Client.Count - 1 do
+    begin
+        Module := Client.ServerModule[I];
+        if Module <> nil then
+            for J := 0 to Module.DocumentCount - 1 do
+            begin
+                Path := Module.Documents[J].FileName;
+                if (DocumentKindForPath(Path) <> '') and (Paths.IndexOf(Path) < 0) then Paths.Add(Path);
+            end;
+    end;
+end;
+
+function ExistingOpenDocumentStates(Paths: TStringList): String;
+var
+    Items, Props: TStringList;
+    Doc: IServerDocument;
+    State: String;
+    I: Integer;
+begin
+    Items := TStringList.Create;
+    try
+        for I := 0 to Paths.Count - 1 do
+        begin
+            Doc := FindOpenDocument(Paths[I]);
+            State := 'closed';
+            if Doc <> nil then
+            begin
+                State := 'open';
+                if Doc.Modified then State := 'modified';
+            end;
+            Props := TStringList.Create;
+            try
+                AddJSONProperty(Props, 'path', Paths[I]);
+                AddJSONProperty(Props, 'kind', DocumentKindForPath(Paths[I]));
+                AddJSONProperty(Props, 'state', State);
+                Items.Add(BuildJSONObject(Props));
+            finally
+                Props.Free;
+            end;
+        end;
+        Result := BuildJSONArray(Items);
+    finally
+        Items.Free;
+    end;
+end;
+
+function SelectOpenProject(SpecPath: String; OpenIfClosed: Boolean = False): String;
+var
+    Spec, Props, Available, ExistingPaths: TStringList;
+    Target, Candidate, Active: IProject;
+    Path, PreviousPath, ActivePath, ErrorText, BeforeState, AfterState, Extension: String;
+    ExistingBefore, ExistingAfter: String;
+    I, Matches: Integer;
+    Started, AlreadyOpen, Opened: Boolean;
+begin
+    Result := 'ERROR: project selection spec file not found';
+    if not FileExists(SpecPath) then Exit;
+    Spec := TStringList.Create;
+    Props := TStringList.Create;
+    Available := TStringList.Create;
+    ExistingPaths := TStringList.Create;
+    Target := nil;
+    Started := False;
+    AlreadyOpen := False;
+    Opened := False;
+    ExistingBefore := '[]';
+    ExistingAfter := '[]';
+    PreviousPath := '';
+    ActivePath := '';
+    BeforeState := BuildJSONArray(ExistingPaths);
+    AfterState := BeforeState;
+    ErrorText := '';
+    Matches := 0;
+    try
+        Spec.LoadFromFile(SpecPath);
+        Path := JSONUnescape(Spec.Values['project_path']);
+        if OpenIfClosed then
+        begin
+            ExistingOpenDocumentPaths(ExistingPaths);
+            ExistingBefore := ExistingOpenDocumentStates(ExistingPaths);
+        end;
+        Active := GetWorkspace.DM_FocusedProject;
+        if Active <> nil then PreviousPath := Active.DM_ProjectFullPath;
+        try
+          repeat
+            Extension := LowerCase(ExtractFileExt(Path));
+            if (Extension <> '.prjpcb') and (Extension <> '.libpkg') then
+                begin ErrorText := 'target must be a PrjPcb or LibPkg'; Break; end;
+            for I := 0 to GetWorkspace.DM_ProjectCount - 1 do
+            begin
+                Candidate := GetWorkspace.DM_Projects(I);
+                Extension := LowerCase(ExtractFileExt(Candidate.DM_ProjectFullPath));
+                if (Extension = '.prjpcb') or (Extension = '.libpkg') then
+                    Available.Add('"' + JSONEscapeString(Candidate.DM_ProjectFullPath) + '"');
+                if NormalizedPath(Candidate.DM_ProjectFullPath) = NormalizedPath(Path) then
+                begin
+                    Target := Candidate;
+                    Inc(Matches);
+                end;
+            end;
+            AlreadyOpen := Matches = 1;
+            if not AlreadyOpen then
+            begin
+                if (Matches > 1) or not OpenIfClosed then
+                    begin ErrorText := 'exact project must already be open exactly once; found ' + IntToStr(Matches); Break; end;
+                if not FileExists(Path) then
+                    begin ErrorText := 'closed project must exist on disk; no project was created'; Break; end;
+                LogScriptError('open_project: open exact project ' + Path);
+                Started := True;
+                Target := GetWorkspace.DM_OpenProject(Path, True);
+                // Re-query: do not trust a returned or focused project by itself.
+                Target := DocumentProject(Path);
+                if Target = nil then begin ErrorText := 'Altium did not open the exact project once'; Break; end;
+                Opened := True;
+                Available.Add('"' + JSONEscapeString(Target.DM_ProjectFullPath) + '"');
+            end;
+            if AlreadyOpen then BeforeState := SelectionDocumentStates(Target);
+            if NormalizedPath(PreviousPath) <> NormalizedPath(Path) then
+            begin
+                LogScriptError('select_project: set current project ' + Path);
+                Started := True;
+                Target.DM_SetAsCurrentProject;
+            end;
+            Active := GetWorkspace.DM_FocusedProject;
+            if Active = nil then begin ErrorText := 'no focused project after selection'; Break; end;
+            ActivePath := Active.DM_ProjectFullPath;
+            AfterState := SelectionDocumentStates(Target);
+            if NormalizedPath(ActivePath) <> NormalizedPath(Path) then
+                begin ErrorText := 'focused project readback does not match the requested path'; Break; end;
+            if AlreadyOpen and (BeforeState <> AfterState) then
+                ErrorText := 'project document open/modified states changed during selection';
+          until True;
+        except
+            ErrorText := ExceptionMessage;
+        end;
+        Active := GetWorkspace.DM_FocusedProject;
+        if Active <> nil then ActivePath := Active.DM_ProjectFullPath;
+        if OpenIfClosed then
+        begin
+            ExistingAfter := ExistingOpenDocumentStates(ExistingPaths);
+            if (ErrorText = '') and (ExistingBefore <> ExistingAfter) then
+                ErrorText := 'opening changed preexisting document open/modified states';
+        end;
+        AddJSONBoolean(Props, 'success', ErrorText = '');
+        AddJSONProperty(Props, 'project_path', Path);
+        AddJSONProperty(Props, 'previous_project_path', PreviousPath);
+        AddJSONProperty(Props, 'active_project_path', ActivePath);
+        AddJSONBoolean(Props, 'changed', NormalizedPath(PreviousPath) <> NormalizedPath(ActivePath));
+        AddJSONBoolean(Props, 'saved', False);
+        AddJSONBoolean(Props, 'project_saved', False);
+        AddJSONBoolean(Props, 'compiled', False);
+        AddJSONBoolean(Props, 'documents_unchanged', BeforeState = AfterState);
+        AddJSONBoolean(Props, 'may_have_changed_focus', (ErrorText <> '') and Started);
+        Props.Add('"documents_before": ' + BeforeState);
+        Props.Add('"documents_after": ' + AfterState);
+        Props.Add('"available_project_paths": ' + BuildJSONArray(Available));
+        if OpenIfClosed then
+        begin
+            AddJSONBoolean(Props, 'already_open', AlreadyOpen);
+            AddJSONBoolean(Props, 'opened', Opened);
+            AddJSONBoolean(Props, 'preexisting_documents_preserved', ExistingBefore = ExistingAfter);
+            Props.Add('"preexisting_documents_before": ' + ExistingBefore);
+            Props.Add('"preexisting_documents_after": ' + ExistingAfter);
+            AddJSONBoolean(Props, 'may_have_opened_project', (ErrorText <> '') and Started);
+        end;
+        if ErrorText <> '' then AddJSONProperty(Props, 'error', ErrorText);
+        Result := DocumentJSON(BuildJSONObject(Props));
+    finally
+        Spec.Free;
+        Props.Free;
+        Available.Free;
+        ExistingPaths.Free;
+    end;
+end;
+
+function ExecuteOpenProject(Request: TStringList): String;
+var
+    I: Integer;
+begin
+    Result := 'ERROR: project opening spec_file is required';
+    for I := 0 to Request.Count - 1 do
+        if Pos('"spec_file":', Request[I]) > 0 then
+        begin
+            Result := SelectOpenProject(JSONLineValue(Request[I]), True);
+            Exit;
+        end;
+end;
+
+function ExecuteSelectProject(Request: TStringList): String;
+var
+    I: Integer;
+begin
+    Result := 'ERROR: project selection spec_file is required';
+    for I := 0 to Request.Count - 1 do
+        if Pos('"spec_file":', Request[I]) > 0 then
+        begin
+            Result := SelectOpenProject(JSONLineValue(Request[I]));
             Exit;
         end;
 end;

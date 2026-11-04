@@ -1122,7 +1122,8 @@ begin
     if (CommandName <> 'edit_schematic') and (CommandName <> 'get_schematic_connectivity') and
        (CommandName <> 'set_library_component_data') and
        (CommandName <> 'create_document') and (CommandName <> 'save_document') and
-       (CommandName <> 'add_document_to_project') and not (((CommandName = 'get_output_job_containers') or
+       (CommandName <> 'open_document') and (CommandName <> 'open_project') and
+       (CommandName <> 'add_document_to_project') and (CommandName <> 'select_project') and not (((CommandName = 'get_output_job_containers') or
              (CommandName = 'run_output_jobs')) and
             (RequestOutJobPath(RequestData) <> '')) then
     begin
@@ -1182,8 +1183,12 @@ begin
             Result := ExecuteSchematicConnectivity(RequestData);
         'set_library_component_data':
             Result := ExecuteLibraryComponentData(RequestData);
-        'create_document', 'save_document', 'add_document_to_project':
+        'create_document', 'open_document', 'save_document', 'add_document_to_project':
             Result := ExecuteManageDocument(CommandName, RequestData);
+        'open_project':
+            Result := ExecuteOpenProject(RequestData);
+        'select_project':
+            Result := ExecuteSelectProject(RequestData);
         'get_footprint_primitives':
             Result := ExecuteGetFootprintPrimitives(RequestData);
         'create_footprints_batch':
@@ -1307,15 +1312,13 @@ end;
 
 // A script that crashes into the debugger leaves its script project focused,
 // and project-level commands (project info, ERC, ...) would then act on it.
-// Remember the last design project and bring it back to the front instead.
+// Recover the last design project without changing the editor documents.
 procedure EnsureDesignProjectFocused();
 var
     Project, Candidate : IProject;
-    Doc : IDocument;
-    ServerDoc : IServerDocument;
     LastPath, StoreFile : String;
     Store : TStringList;
-    P, I : Integer;
+    P : Integer;
 begin
     StoreFile := ROOT_DIR + 'last_project.txt';
     Project := GetWorkspace.DM_FocusedProject;
@@ -1323,7 +1326,8 @@ begin
     try
         if (Project <> Nil) and not IsScriptProject(Project) then
         begin
-            Store.Text := Project.DM_ProjectFullPath;
+            // ASCII JSON escapes preserve Unicode paths in the ANSI hint file.
+            Store.Text := 'json:' + DocumentJSON(JSONEscapeString(Project.DM_ProjectFullPath));
             Store.SaveToFile(StoreFile);
         end
         else
@@ -1332,7 +1336,14 @@ begin
             if FileExists(StoreFile) then
             begin
                 Store.LoadFromFile(StoreFile);
-                if Store.Count > 0 then LastPath := UpperCase(Trim(Store[0]));
+                if Store.Count > 0 then
+                begin
+                    LastPath := Trim(Store[0]);
+                    // Existing installations may still have a raw-path hint.
+                    if Copy(LastPath, 1, 5) = 'json:' then
+                        LastPath := JSONUnescape(Copy(LastPath, 6, Length(LastPath)));
+                    LastPath := UpperCase(LastPath);
+                end;
             end;
 
             // The remembered project if it is still open, else the first design project
@@ -1345,18 +1356,8 @@ begin
                         Candidate := Project;
             end;
 
-            // Showing one of its already open documents makes it the focused project
-            if Candidate <> Nil then
-                for I := 0 to Candidate.DM_LogicalDocumentCount - 1 do
-                begin
-                    Doc := Candidate.DM_LogicalDocuments(I);
-                    ServerDoc := Client.GetDocumentByPath(Doc.DM_FullPath);
-                    if ServerDoc <> Nil then
-                    begin
-                        Client.ShowDocument(ServerDoc);
-                        Break;
-                    end;
-                end;
+            // Select the project itself, including projects with no open sheets.
+            if Candidate <> Nil then Candidate.DM_SetAsCurrentProject;
         end;
     finally
         Store.Free;
@@ -1426,8 +1427,16 @@ begin
             // Execute the command if valid
             if CommandType <> '' then
             begin
-                EnsureDesignProjectFocused();
+                // Exact project selection must not invoke the legacy fallback,
+                // which can show another project's document before validation.
+                if (CommandType <> 'select_project') and (CommandType <> 'open_project') and
+                   (CommandType <> 'open_document') then EnsureDesignProjectFocused();
                 Result := ExecuteCommand(CommandType);
+                // Remember an explicitly selected project for later recovery.
+                // This writes only the toolkit's context hint, never a design file.
+                if ((CommandType = 'select_project') or (CommandType = 'open_project')) and
+                   (Pos('"success": true', Result) > 0) then
+                    EnsureDesignProjectFocused();
 
                 if Result <> '' then
                 begin

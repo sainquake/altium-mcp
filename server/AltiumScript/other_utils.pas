@@ -1275,7 +1275,7 @@ begin
 
         OutputLines := TStringList.Create;
         try
-            OutputLines.Text := BuildJSONObject(ResultProps);
+            OutputLines.Text := DocumentJSON(BuildJSONObject(ResultProps));
             Result := WriteJSONToFile(OutputLines, ROOT_DIR + 'temp_project_info.json');
         finally
             OutputLines.Free;
