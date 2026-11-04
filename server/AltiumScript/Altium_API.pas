@@ -199,17 +199,21 @@ end;
 function ExecuteCreateSchematicSymbol(RequestData: TStringList): String;
 var
     ParamValue: String;
-    i, ValueStart: Integer;
-    ComponentName: String;
+    i, J, ValueStart: Integer;
+    ComponentName, MetadataPath, Description, Prefix: String;
     PartCount: Integer;
     PinsList: TStringList;
     GraphicsList: TStringList;
+    Metadata, ParametersList: TStringList;
 begin
     // Look for component name
     ComponentName := '';
+    MetadataPath := '';
     PartCount := 1;  // Default to single-part symbol
     PinsList := TStringList.Create;
     GraphicsList := TStringList.Create;
+    Metadata := TStringList.Create;
+    ParametersList := TStringList.Create;
 
     try
         // Parse parameters from the request
@@ -220,6 +224,8 @@ begin
             begin
                 ComponentName := JSONLineValue(RequestData[i]);
             end
+            else if (Pos('"metadata_file"', RequestData[i]) > 0) then
+                MetadataPath := JSONLineValue(RequestData[i])
             // Look for part_count
             else if (Pos('"part_count"', RequestData[i]) > 0) then
             begin
@@ -268,20 +274,24 @@ begin
 
                     i := i + 1;
                 end;
-            end
-            // Look for description
-            else if (Pos('"description"', RequestData[i]) > 0) then
-            begin
-                ValueStart := Pos(':', RequestData[i]) + 1;
-                ParamValue := Copy(RequestData[i], ValueStart, Length(RequestData[i]) - ValueStart + 1);
-                ParamValue := JSONLineValue(RequestData[i]);
-                PinsList.Add('Description=' + ParamValue);
             end;
         end;
 
+        if (MetadataPath = '') or not FileExists(MetadataPath) then
+        begin
+            Result := 'ERROR: required symbol metadata_file is missing; refresh the MCP server';
+            Exit;
+        end;
+        Metadata.LoadFromFile(MetadataPath);
+        Description := EditValue(Metadata, 'description');
+        for J := 0 to StrToInt(EditValue(Metadata, 'parameter_count')) - 1 do
+        begin
+            Prefix := 'p' + IntToStr(J) + '.';
+            ParametersList.Add(EditValue(Metadata, Prefix + 'name') + '=' + EditValue(Metadata, Prefix + 'value'));
+        end;
         if ComponentName <> '' then
         begin
-            Result := CreateSchematicSymbol(ComponentName, PinsList, GraphicsList, PartCount);
+            Result := CreateSchematicSymbol(ComponentName, Description, PinsList, GraphicsList, ParametersList, PartCount);
         end
         else
         begin
@@ -291,6 +301,8 @@ begin
     finally
         PinsList.Free;
         GraphicsList.Free;
+        Metadata.Free;
+        ParametersList.Free;
     end;
 end;
 

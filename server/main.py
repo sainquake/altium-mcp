@@ -29,6 +29,7 @@ from outjob_parser import parse_outjob
 from schematic_editor import validate_request as validate_schematic_edit
 import schematic_connectivity
 import library_component_data
+import symbol_metadata
 import document_management
 from server_info import capture_runtime_info
 
@@ -836,7 +837,8 @@ async def search_library_symbol(ctx: Context, symbol_name: str, library_path: st
     return json.dumps(result, indent=2)
 
 @mcp.tool()
-async def create_schematic_symbol(ctx: Context, symbol_name: str, description: str, pins: list, part_count: int = 1, graphics: list = None) -> str:
+async def create_schematic_symbol(ctx: Context, symbol_name: str, description: str, pins: list,
+                                  parameters: dict, part_count: int = 1, graphics: list = None) -> str:
     r"""
     Before executing, run get_symbol_placement_rules first.
 
@@ -865,7 +867,17 @@ async def create_schematic_symbol(ctx: Context, symbol_name: str, description: s
 
     Args:
         symbol_name (str): Name of the symbol to create
-        description (str): Description of the schematic symbol
+        description (str): Searchable native Description: component category,
+                    function, key ratings/specifications and package, based on
+                    the datasheet. At least three words; never just an MPN or
+                    placeholder. Do not guess unavailable specifications.
+        parameters (dict): Required nonempty string fields: Value, MF, MP,
+                    HelpURL (absolute HTTP(S) documentation URL), Package, Type,
+                    Instructions (e.g. Fit or DNP), System (functional block).
+                    Missing/placeholder data fails before Altium is called.
+                    Names are case-insensitive and stored with canonical spelling.
+                    Pacage/Pacage Metric are obsolete; use Package. JLCPCB fields
+                    are optional. Comment is set to MP and hidden; Value is visible.
         pins (list): List of pin data in format
                     "pin_number|pin_name|pin_type|pin_orientation|x|y[|owner_part_id[|length[|show_name[|show_designator]]]]"
                     Pin types: eElectricHiZ, eElectricInput, eElectricIO, eElectricOpenCollector,
@@ -900,11 +912,16 @@ async def create_schematic_symbol(ctx: Context, symbol_name: str, description: s
     Returns:
         str: JSON object with the result of the component creation
     """
+    try:
+        spec, parameters = symbol_metadata.prepare(symbol_name, description, pins, parameters, part_count, graphics)
+    except (ValueError, TypeError) as exc:
+        return json.dumps({"success": False, "error": str(exc), "saved": False, "may_have_partial_changes": False})
     logger.info(f"Creating schematic symbol: {symbol_name} with {len(pins)} pins, {part_count} part(s)")
-
+    metadata_file = EXCHANGE_DIR / f"symbol_metadata_{uuid.uuid4().hex}.txt"
+    write_altium_text(metadata_file, spec)
     params = {
         "symbol_name": symbol_name,
-        "description": description,
+        "metadata_file": str(metadata_file),
         "part_count": part_count,
         "pins": pins
     }
@@ -912,19 +929,25 @@ async def create_schematic_symbol(ctx: Context, symbol_name: str, description: s
         params["graphics"] = graphics
 
     # Execute the command in Altium to create the symbol
-    response = await altium_bridge.execute_command(
-        "create_schematic_symbol",
-        params
-    )
+    try:
+        response = await altium_bridge.execute_command("create_schematic_symbol", params)
+    finally:
+        if 'response' in locals() and response.get("success", False):
+            metadata_file.unlink(missing_ok=True)
     
     # Check for success
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
         logger.error(f"Error creating symbol: {error_msg}")
-        return json.dumps({"success": False, "error": f"Failed to create symbol: {error_msg}"})
+        return json.dumps({"success": False, "error": f"Failed to create symbol: {error_msg}",
+                           "saved": False, "may_have_partial_changes": True, "metadata_file": str(metadata_file)})
     
     # Get the result data
     result = response.get("result", {})
+    if isinstance(result, str):
+        result = json.loads(result)
+    if result.get("success"):
+        symbol_metadata.verify(result, description, parameters)
     
     logger.info(f"Symbol {symbol_name} created successfully with {len(pins)} pins")
     return json.dumps(result, indent=2)
@@ -2018,28 +2041,55 @@ async def create_symbols_batch(ctx: Context, spec_file: str) -> str:
                                          an already-open library is only
                                          focused, never reloaded)
             SYMBOL|<name>|<description>|<part_count>
+            PARAM|<name>|<value>   (required metadata for each SYMBOL)
             PIN|<same pipe fields as create_schematic_symbol pins>
             GRAPHIC|<same entry format as create_schematic_symbol graphics>
             Each SYMBOL line starts a new symbol; PIN/GRAPHIC lines belong
             to the most recent SYMBOL.
+            Every symbol requires Value, MF, MP, HelpURL, Package, Type,
+            Instructions and System with actual nonempty string values, plus
+            a searchable description (category, function/specifications, package).
+            Use Package; Pacage is rejected. All blocks are checked before edits.
+            Values after PARAM's second | are preserved, including additional |.
 
     Returns:
         str: JSON object with created count and a failed name list
     """
+    try:
+        text, symbols = symbol_metadata.prepare_batch(spec_file)
+    except (ValueError, TypeError, OSError) as exc:
+        return json.dumps({"success": False, "error": str(exc), "saved": False, "may_have_partial_changes": False})
     logger.info(f"Creating symbols batch from {spec_file}")
-
-    response = await altium_bridge.execute_command(
-        "create_symbols_batch",
-        {"spec_file": spec_file}
-    )
+    prepared_file = EXCHANGE_DIR / f"symbols_batch_{uuid.uuid4().hex}.txt"
+    write_altium_text(prepared_file, text)
+    try:
+        response = await altium_bridge.execute_command("create_symbols_batch", {"spec_file": str(prepared_file)})
+    finally:
+        if 'response' in locals() and response.get("success", False):
+            prepared_file.unlink(missing_ok=True)
 
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
         logger.error(f"Error in batch symbol creation: {error_msg}")
-        return json.dumps({"success": False, "error": f"Failed batch creation: {error_msg}"})
+        return json.dumps({"success": False, "error": f"Failed batch creation: {error_msg}",
+                           "saved": False, "may_have_partial_changes": True, "spec_file": str(prepared_file)})
 
     result = response.get("result", {})
-    return json.dumps(result, indent=2) if not isinstance(result, str) else result
+    if isinstance(result, str):
+        result = json.loads(result)
+    results = result.get("components", [])
+    errors = []
+    if len(results) != len(symbols):
+        errors.append("created-symbol readback count mismatch")
+    for item, request in zip(results, symbols):
+        if item.get("component_name") != request["symbol_name"]:
+            errors.append("created-symbol order/name mismatch")
+        symbol_metadata.verify(item, request["description"], request["parameters"])
+        errors.extend(item["verification"]["errors"])
+    result["verification"] = {"passed": not errors, "errors": errors}
+    result["success"] = not errors and not result.get("failed") and result.get("created") == len(symbols)
+    result["may_have_partial_changes"] = not result["success"] and bool(result.get("created"))
+    return json.dumps(result, indent=2)
 
 @mcp.tool()
 async def get_symbol_primitives(ctx: Context, library_path: str = "", symbol_name: str = "") -> str:

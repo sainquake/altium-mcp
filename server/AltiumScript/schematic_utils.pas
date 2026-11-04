@@ -170,7 +170,44 @@ begin
     end;
 end;
 
-function CreateSchematicSymbol(SymbolName: String; PinsList: TStringList; GraphicsList: TStringList; PartCount: Integer = 1): String;
+function SymbolMetadataError(SymbolName, Description: String; Parameters: TStringList): String;
+var
+    Required: TStringList;
+    I: Integer;
+begin
+    Result := '';
+    if (Trim(Description) = '') or SameText(Description, 'New Component') or
+       SameText(Description, SymbolName) then
+    begin
+        Result := 'a searchable component Description is required';
+        Exit;
+    end;
+    if Parameters = nil then
+    begin
+        Result := 'component parameters are required';
+        Exit;
+    end;
+    if (Parameters.IndexOfName('Pacage') >= 0) or (Parameters.IndexOfName('Pacage Metric') >= 0) then
+    begin
+        Result := 'Pacage is obsolete; use Package';
+        Exit;
+    end;
+    Required := TStringList.Create;
+    try
+        Required.CommaText := 'Value,MF,MP,HelpURL,Package,Type,Instructions,System';
+        for I := 0 to Required.Count - 1 do
+            if Trim(Parameters.Values[Required[I]]) = '' then
+            begin
+                Result := 'missing or empty required parameter: ' + Required[I];
+                Exit;
+            end;
+    finally
+        Required.Free;
+    end;
+end;
+
+function CreateSchematicSymbol(SymbolName, Description: String; PinsList, GraphicsList,
+                               Parameters: TStringList; PartCount: Integer = 1): String;
 var
     CurrentLib       : ISch_Lib;
     SchComponent     : ISch_Component;
@@ -182,6 +219,8 @@ var
     SchArc           : ISch_Arc;
     SchEllipse       : ISch_Ellipse;
     SchLabel         : ISch_Label;
+    Parameter, ValueParameter : ISch_Parameter;
+    ClientDoc        : IServerDocument;
     I, J, PinCount   : Integer;
     GraphicsCount    : Integer;
     Entry            : String;
@@ -200,35 +239,35 @@ var
     MinX, MaxX, MinY, MaxY : Integer;
     HasPins          : Boolean;
     ResultProps      : TStringList;
-    Description      : String;
-    OutputLines      : TStringList;
 begin
+    Result := SymbolMetadataError(SymbolName, Description, Parameters);
+    if Result <> '' then
+    begin
+        Result := 'ERROR: ' + Result;
+        Exit;
+    end;
     // Check if we have a schematic library document
     CurrentLib := SchServer.GetCurrentSchDocument;
+    if CurrentLib = nil then
+    begin
+        Result := 'ERROR: Please open a schematic library document';
+        Exit;
+    end;
     if (CurrentLib.ObjectID <> eSchLib) Then
     begin
         Result := 'ERROR: Please open a schematic library document';
         Exit;
     end;
 
-    Description := 'New Component';  // Default description
-
-    // Parse the pins list for description and auto-detect PartCount from max owner_part_id
+    // Auto-detect PartCount from max owner_part_id.
     for I := 0 to PinsList.Count - 1 do
     begin
-        if (Pos('Description=', PinsList[I]) = 1) then
+        FieldValue := Trim(GetFieldFromPipeString(PinsList[I], 6));
+        if (FieldValue <> '') then
         begin
-            Description := Copy(PinsList[I], 13, Length(PinsList[I]) - 12);
-        end
-        else
-        begin
-            FieldValue := Trim(GetFieldFromPipeString(PinsList[I], 6));
-            if (FieldValue <> '') then
-            begin
-                PinOwnerPartId := StrToInt(FieldValue);
-                if (PinOwnerPartId > PartCount) then
-                    PartCount := PinOwnerPartId;
-            end;
+            PinOwnerPartId := StrToInt(FieldValue);
+            if (PinOwnerPartId > PartCount) then
+                PartCount := PinOwnerPartId;
         end;
     end;
 
@@ -262,6 +301,26 @@ begin
     SchComponent.LibReference := SymbolName;
     SchComponent.ComponentDescription := Description;
     SchComponent.Designator.Text := 'U?';
+    SchComponent.Comment.Text := Parameters.Values['MP'];
+    SchComponent.Comment.IsHidden := True;
+    ValueParameter := nil;
+    for I := 0 to Parameters.Count - 1 do
+    begin
+        Parameter := SchServer.SchObjectFactory(eParameter, eCreate_Default);
+        if Parameter = nil then
+        begin
+            Result := 'ERROR: could not create component parameter';
+            Exit;
+        end;
+        Parameter.Name := Parameters.Names[I];
+        Parameter.Text := Parameters.Values[Parameter.Name];
+        Parameter.OwnerPartId := 0;
+        Parameter.ParamType := eParameterType_String;
+        Parameter.ReadOnlyState := eReadOnly_None;
+        Parameter.IsHidden := True;
+        if SameText(Parameter.Name, 'Value') then ValueParameter := Parameter;
+        SchComponent.AddSchObject(Parameter);
+    end;
 
     // Create a body for each part: an auto-sized rectangle when no explicit
     // graphics are given (legacy behavior), otherwise the caller's graphics
@@ -280,8 +339,6 @@ begin
 
         for I := 0 to PinsList.Count - 1 do
         begin
-            if (Pos('Description=', PinsList[I]) = 1) then Continue;
-
             FieldValue := Trim(GetFieldFromPipeString(PinsList[I], 4));
             if (FieldValue = '') then Continue;
             PinX := StrToInt(FieldValue);
@@ -508,8 +565,6 @@ begin
     //   number|name|electrical|orientation|x|y[|owner_part_id[|length[|show_name[|show_designator]]]]
     for I := 0 to PinsList.Count - 1 do
     begin
-        if (Pos('Description=', PinsList[I]) = 1) then Continue;
-
         Entry := PinsList[I];
         FieldValue := Trim(GetFieldFromPipeString(Entry, 5));
         if (FieldValue = '') then Continue;
@@ -566,15 +621,28 @@ begin
         PinCount := PinCount + 1;
     end;
 
-    // Add the component to the library
-    CurrentLib.AddSchComponent(SchComponent);
+    if ValueParameter <> nil then
+    begin
+        ValueParameter.Autoposition := False;
+        ValueParameter.Location := Point(SchComponent.BoundingRectangle.Left,
+            SchComponent.BoundingRectangle.Bottom - MilsToCoord(100));
+        ValueParameter.IsHidden := False;
+    end;
 
-    // Send a system notification that a new component has been added to the library
-    SchServer.RobotManager.SendMessage(nil, c_BroadCast, SCHM_PrimitiveRegistration, SchComponent.I_ObjectAddress);
-    CurrentLib.CurrentSchComponent := SchComponent;
+    // Register the complete symbol in an editor transaction, without saving.
+    SchServer.ProcessControl.PreProcess(CurrentLib, '');
+    try
+        CurrentLib.AddSchComponent(SchComponent);
+        SchServer.RobotManager.SendMessage(nil, c_BroadCast, SCHM_PrimitiveRegistration, SchComponent.I_ObjectAddress);
+        CurrentLib.CurrentSchComponent := SchComponent;
+    finally
+        SchServer.ProcessControl.PostProcess(CurrentLib, '');
+    end;
+    ClientDoc := Client.GetDocumentByPath(CurrentLib.DocumentName);
 
     // Refresh library
     CurrentLib.GraphicallyInvalidate;
+    if ClientDoc <> nil then ClientDoc.SetModified(True);
 
     // Create result JSON
     ResultProps := TStringList.Create;
@@ -583,15 +651,10 @@ begin
         AddJSONProperty(ResultProps, 'component_name', SymbolName);
         AddJSONInteger(ResultProps, 'pins_count', PinCount);
         AddJSONInteger(ResultProps, 'part_count', PartCount);
-
-        // Build final JSON
-        OutputLines := TStringList.Create;
-        try
-            OutputLines.Text := BuildJSONObject(ResultProps);
-            Result := OutputLines.Text;
-        finally
-            OutputLines.Free;
-        end;
+        AddJSONBoolean(ResultProps, 'saved', False);
+        if ClientDoc <> nil then AddJSONBoolean(ResultProps, 'is_modified', ClientDoc.Modified);
+        ResultProps.Add('"metadata": ' + LibraryComponentSnapshot(SchComponent));
+        Result := LibraryDataASCIIJSON(BuildJSONObject(ResultProps));
     finally
         ResultProps.Free;
     end;
@@ -784,17 +847,19 @@ begin
     end;
 end;
 
-// Create one symbol for CreateSymbolsBatch. Returns True when created.
-function BatchCreateOne(SymName, SymDesc: String; PartCount: Integer; PinsList, GraphicsList: TStringList): Boolean;
+// Create one symbol and retain its actual metadata readback, including failures.
+function BatchCreateOne(SymName, SymDesc: String; PartCount: Integer;
+                        PinsList, GraphicsList, ParametersList, ComponentsArray: TStringList): Boolean;
 var
     R: String;
 begin
     Result := False;
     if (SymName = '') then Exit;
-    if (SymDesc <> '') then
-        PinsList.Add('Description=' + SymDesc);
-    R := CreateSchematicSymbol(SymName, PinsList, GraphicsList, PartCount);
+    R := CreateSchematicSymbol(SymName, SymDesc, PinsList, GraphicsList, ParametersList, PartCount);
     Result := (Pos('"success": true', R) > 0);
+    if Result then ComponentsArray.Add(R)
+    else ComponentsArray.Add('{"success": false, "component_name": "' + JSONEscapeString(SymName) +
+        '", "error": "' + JSONEscapeString(R) + '"}');
 end;
 
 // Create many symbols in a single script run from a spec file. The file is
@@ -802,6 +867,7 @@ end;
 // is preserved exactly):
 //   LIBRARY|<path to .SchLib>            (optional first line - focus/open)
 //   SYMBOL|<name>|<description>|<part_count>
+//   PARAM|<name>|<value>                (required metadata per symbol)
 //   PIN|<same fields as create_schematic_symbol pins>
 //   GRAPHIC|<same entry format as create_schematic_symbol graphics>
 // Each SYMBOL line flushes the previous symbol. Far fewer Altium script
@@ -811,6 +877,7 @@ var
     Lines        : TStringList;
     PinsList     : TStringList;
     GraphicsList : TStringList;
+    ParametersList, ComponentsArray : TStringList;
     FailedArray  : TStringList;
     ResultProps  : TStringList;
     ServerDoc    : IServerDocument;
@@ -818,7 +885,7 @@ var
     LibPath      : String;
     CurrentName  : String;
     CurrentDesc  : String;
-    FieldValue   : String;
+    FieldValue, ParameterName : String;
     PartCount    : Integer;
     CreatedCount : Integer;
     i            : Integer;
@@ -832,6 +899,8 @@ begin
     Lines := TStringList.Create;
     PinsList := TStringList.Create;
     GraphicsList := TStringList.Create;
+    ParametersList := TStringList.Create;
+    ComponentsArray := TStringList.Create;
     FailedArray := TStringList.Create;
     ResultProps := TStringList.Create;
     CurrentName := '';
@@ -870,13 +939,14 @@ begin
                 // Flush the previous symbol
                 if (CurrentName <> '') then
                 begin
-                    if BatchCreateOne(CurrentName, CurrentDesc, PartCount, PinsList, GraphicsList) then
+                    if BatchCreateOne(CurrentName, CurrentDesc, PartCount, PinsList, GraphicsList, ParametersList, ComponentsArray) then
                         CreatedCount := CreatedCount + 1
                     else
                         FailedArray.Add('"' + JSONEscapeString(CurrentName) + '"');
                 end;
                 PinsList.Clear;
                 GraphicsList.Clear;
+                ParametersList.Clear;
                 CurrentName := Trim(GetFieldFromPipeString(Line, 1));
                 CurrentDesc := GetFieldFromPipeString(Line, 2);
                 FieldValue := Trim(GetFieldFromPipeString(Line, 3));
@@ -884,6 +954,21 @@ begin
                     PartCount := StrToInt(FieldValue)
                 else
                     PartCount := 1;
+            end
+            else if (Kind = 'PARAM') then
+            begin
+                ParameterName := GetFieldFromPipeString(Line, 1);
+                if SameText(ParameterName, 'value') then ParameterName := 'Value';
+                if SameText(ParameterName, 'mf') then ParameterName := 'MF';
+                if SameText(ParameterName, 'mp') then ParameterName := 'MP';
+                if SameText(ParameterName, 'helpurl') then ParameterName := 'HelpURL';
+                if SameText(ParameterName, 'package') then ParameterName := 'Package';
+                if SameText(ParameterName, 'type') then ParameterName := 'Type';
+                if SameText(ParameterName, 'instructions') then ParameterName := 'Instructions';
+                if SameText(ParameterName, 'system') then ParameterName := 'System';
+                FieldValue := Copy(Line, 7, Length(Line));
+                FieldValue := Copy(FieldValue, Pos('|', FieldValue) + 1, Length(FieldValue));
+                ParametersList.Add(ParameterName + '=' + FieldValue);
             end
             else if (Kind = 'PIN') then
             begin
@@ -898,23 +983,28 @@ begin
         // Flush the last symbol
         if (CurrentName <> '') then
         begin
-            if BatchCreateOne(CurrentName, CurrentDesc, PartCount, PinsList, GraphicsList) then
+            if BatchCreateOne(CurrentName, CurrentDesc, PartCount, PinsList, GraphicsList, ParametersList, ComponentsArray) then
                 CreatedCount := CreatedCount + 1
             else
                 FailedArray.Add('"' + JSONEscapeString(CurrentName) + '"');
         end;
 
         AddJSONInteger(ResultProps, 'created', CreatedCount);
+        AddJSONBoolean(ResultProps, 'success', FailedArray.Count = 0);
+        AddJSONBoolean(ResultProps, 'saved', False);
+        ResultProps.Add(BuildJSONArray(ComponentsArray, 'components'));
         if (FailedArray.Count > 0) then
             ResultProps.Add(BuildJSONArray(FailedArray, 'failed'))
         else
             ResultProps.Add('"failed": []');
 
-        Result := BuildJSONObject(ResultProps);
+        Result := LibraryDataASCIIJSON(BuildJSONObject(ResultProps));
     finally
         Lines.Free;
         PinsList.Free;
         GraphicsList.Free;
+        ParametersList.Free;
+        ComponentsArray.Free;
         FailedArray.Free;
         ResultProps.Free;
     end;
