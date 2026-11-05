@@ -183,6 +183,10 @@ DItemRevisionGUID=
 GenerateClassCluster=0
 DocumentUniqueId=
 
+[Document12]
+DocumentPath=schematic_cloning.pas
+AnnotationEnabled=1
+
 [OutputGroup1]
 Name=Netlist Outputs
 Description=

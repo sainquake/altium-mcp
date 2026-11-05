@@ -41,6 +41,7 @@ import library_component_data
 import symbol_metadata
 import document_management
 import document_closing
+import schematic_cloning
 import project_selection
 import lcsc_catalog
 from server_info import capture_runtime_info
@@ -162,7 +163,7 @@ MUTATING_COMMANDS = {
     "create_footprints_batch", "layout_duplicator", "layout_duplicator_apply",
     "run_output_jobs", "create_pcb_footprint", "edit_schematic", "edit_schematic_actions",
     "set_library_component_data", "create_document", "open_document", "save_document",
-    "add_document_to_project", "open_project", "select_project", "close_document",
+    "add_document_to_project", "open_project", "select_project", "close_document", "clone_schematic_components",
 }
 
 # Present while a script the MCP launched is stuck (paused in Altium's
@@ -2484,6 +2485,26 @@ async def set_library_component_data(ctx: Context, library_path: str, symbol_nam
     finally:
         if 'response' in locals() and response.get("success", False):
             spec_path.unlink(missing_ok=True)
+
+
+@_tool()
+async def clone_schematic_components(ctx: Context, source_sheet: str, target_sheet: str, designators: list) -> str:
+    """Clone placed components between two exact different SchDocs, without saving.
+
+    designators is a case-insensitive list of 1..500 distinct designators. Copies
+    ALL placed parts of each requested multipart component. Preserves designators,
+    coordinates, rotation/mirror, parameter text/visibility, pins, primitives and
+    library/model links; assigns fresh component and nonempty child UIDs. Source
+    remains unchanged; only target becomes Modified. Both paths must exist on disk
+    or identify already-open named unsaved SchDocs; open buffers are never reloaded.
+    Preflight rejects missing/ambiguous sources and any target designator collision
+    before cloning anything. Does not copy external wires, labels, sheet graphics,
+    compile, update PCB or change project membership. Preserved designators need
+    reannotation when both sheets remain in one project. API errors may leave
+    partial copies: inspect cloned_count, components, failed_index and uncertainty
+    before retrying. Returns source/clone preservation and old-to-new UID mappings.
+    """
+    return await schematic_cloning.execute(altium_bridge, EXCHANGE_DIR, source_sheet, target_sheet, designators)
 
 
 @_tool()
