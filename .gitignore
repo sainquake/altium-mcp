@@ -24,3 +24,4 @@ dev/make_circuit.py
 dev/sheet*_parts.json
 dev/sheet*_rebuild.py
 altium-mcp-requests.md
+/.codex-remote-attachments
