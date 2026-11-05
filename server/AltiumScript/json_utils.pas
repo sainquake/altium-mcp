@@ -166,11 +166,15 @@ end;
 // Decode JSON string escapes: \\ \" \/ \n \r \t and \uXXXX
 function JSONUnescape(S: String): String;
 var
-    i : Integer;
+    i, Code : Integer;
     C : String;
+    WideUnits: TStringList;
+    WideText: String;
 begin
     Result := '';
     i := 1;
+    WideUnits := nil;
+    try
     while (i <= Length(S)) do
     begin
         C := Copy(S, i, 1);
@@ -184,9 +188,27 @@ begin
                 Result := Result + #13
             else if (C = 't') then
                 Result := Result + #9
+            else if (C = 'b') then
+                Result := Result + #8
+            else if (C = 'f') then
+                Result := Result + #12
             else if (C = 'u') and (i + 4 <= Length(S)) then
             begin
-                Result := Result + Chr(StrToInt('$' + Copy(S, i + 1, 4)));
+                Code := StrToInt('$' + Copy(S, i + 1, 4));
+                if Code < 256 then Result := Result + Chr(Code)
+                else
+                begin
+                    // Chr truncates to a byte and WideChar is unavailable in
+                    // Altium DelphiScript. Load code units once per value;
+                    // this also preserves UTF-16 surrogate pairs losslessly.
+                    if WideUnits = nil then
+                    begin
+                        WideUnits := TStringList.Create;
+                        WideUnits.LoadFromFile(ROOT_DIR + 'unicode_utf16.bin');
+                        WideText := WideUnits[0];
+                    end;
+                    Result := Result + Copy(WideText, Code - 255, 1);
+                end;
                 i := i + 4;
             end
             else
@@ -195,6 +217,9 @@ begin
         else
             Result := Result + C;
         i := i + 1;
+    end;
+    finally
+        if WideUnits <> nil then WideUnits.Free;
     end;
 end;
 

@@ -1214,6 +1214,11 @@ begin
         Exit;
     end;
 
+    if (LibraryPath <> '') and (NormalizedPath(CurrentLib.DocumentName) <> NormalizedPath(LibraryPath)) then
+    begin
+        Result := 'ERROR: Focused schematic library identity mismatch';
+        Exit;
+    end;
     ResultProps := TStringList.Create;
     SymbolsArray := TStringList.Create;
     Found := False;
@@ -2363,6 +2368,9 @@ begin
         if not Found then
         begin
             Iter := Comp.SchIterator_Create;
+            // Implementation/model objects have no OwnerPartId or geometry.
+            Iter.AddFilter_ObjectSet(MkSet(ePin, eRectangle, eRoundRectangle, eLine,
+                ePolyline, ePolygon, eBezier, eArc, ePie, eEllipticalArc, eEllipse));
             Prim := Iter.FirstSchObject;
             while (Prim <> nil) do
             begin
@@ -2688,6 +2696,11 @@ begin
     try
         AddJSONProperty(PProps, 'text', Comp.Comment.Text);
         AddJSONBoolean(PProps, 'visible', not Comp.Comment.IsHidden);
+        AddJSONNumber(PProps, 'x', CoordToMils(Comp.Comment.Location.X));
+        AddJSONNumber(PProps, 'y', CoordToMils(Comp.Comment.Location.Y));
+        AddJSONProperty(PProps, 'justification', JustificationName(Comp.Comment.Justification));
+        AddJSONBoolean(PProps, 'autoposition', Comp.Comment.Autoposition);
+        PProps.Add('"font": ' + FontJSON(Comp.Comment.FontID));
         Props.Add('"comment": ' + BuildJSONObject(PProps, 2));
     finally
         PProps.Free;

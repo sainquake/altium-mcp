@@ -161,6 +161,14 @@ async def run(args):
                 require(result)
         if original and not report.get("executor_outcome_unknown"):
             require(await call("restore_project", main.select_project, project))
+            current = await call("states_before_restore", main.get_project_info)
+            current_states = {PureWindowsPath(d["path"]): d["state"] for d in current["documents"]}
+            for index, doc in enumerate(original["documents"]):
+                if doc["state"] == "closed" and current_states.get(PureWindowsPath(doc["path"]), "closed") != "closed":
+                    # Sources opened read-only by this harness return to their
+                    # prior closed state. Refuse to discard any unexpected edit.
+                    require(await call("restore_closed_source_" + str(index), main.close_document,
+                                       doc["path"], require_clean=True))
             if previous_editor:
                 require(await call("restore_editor", main.open_document, previous_editor))
                 require(await call("restore_project_after_editor", main.select_project, project))

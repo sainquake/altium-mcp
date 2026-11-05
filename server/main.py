@@ -28,7 +28,7 @@ import script_bundle
 import pcblib_file
 import uuid
 
-from altium_files import long_path, read_altium_text, write_altium_text
+from altium_files import long_path, read_altium_text, write_altium_text, ensure_unicode_table
 from exchange_lock import ExchangeLock
 from altium_install import find_altium_exe
 import routing
@@ -42,6 +42,7 @@ import symbol_metadata
 import document_management
 import document_closing
 import schematic_cloning
+import footprint_editor
 import project_selection
 import lcsc_catalog
 from server_info import capture_runtime_info
@@ -143,6 +144,7 @@ def _remove_leftover_temp_files(folder: Path = EXCHANGE_DIR):
 
 
 _remove_leftover_temp_files()
+ensure_unicode_table(EXCHANGE_DIR)
 
 # Seconds for a running Altium to pick up a request (normally ~1-5 s), for a
 # cold Altium launch to get that far, for a started command to go without
@@ -164,6 +166,7 @@ MUTATING_COMMANDS = {
     "run_output_jobs", "create_pcb_footprint", "edit_schematic", "edit_schematic_actions",
     "set_library_component_data", "create_document", "open_document", "save_document",
     "add_document_to_project", "open_project", "select_project", "close_document", "clone_schematic_components",
+    "set_footprint_pad_settings", "edit_footprint_primitives",
 }
 
 # Present while a script the MCP launched is stuck (paused in Altium's
@@ -551,7 +554,7 @@ class AltiumBridge:
                 # for it, Altium is busy with another server's command, which
                 # is no reason to give up.
                 if await asyncio.to_thread(sandbox.altium_hung):
-                    return {"success": False, "error": ALTIUM_HUNG_ERROR}
+                    return {"success": False, "error": ALTIUM_HUNG_ERROR, "command_started": False}
                 response = await self._execute_command_locked(command, params, timeout)
             finally:
                 self._exchange_lock.release()
@@ -2007,11 +2010,13 @@ async def get_footprint_primitives(ctx: Context, library_path: str = "", footpri
     - footprint_name given (exact, case-insensitive): full geometry dump -
       pads (position, rotation, layer, sizes/shape per stack, hole size/
       type/width/rotation, plating, paste_mode/paste_expansion,
-      mask_mode/mask_expansion, locked), tracks, arcs, fills, texts,
+      mask_mode/mask_expansion, locked, pad_settings with mm expansions
+      and native cache validity), tracks, arcs, fills, texts,
       regions (outline vertices). Coordinates in mils relative to the
       footprint origin (also for the footprint shown in the editor, which
       Altium holds offset by the library origin); shapes and hole types as
-      raw Altium enum ints; layers as names. 3D component bodies are listed
+      raw Altium enum ints; layers as names. library_origin_x/y are in mils.
+      3D component bodies are listed
       apart in bodies_3d, not among the primitives, so the
       create_footprints_batch round-trip is unchanged: model_file,
       model_embedded, model_x/model_y (offset from the footprint origin),
@@ -2058,6 +2063,53 @@ async def get_footprint_primitives(ctx: Context, library_path: str = "", footpri
     return json.dumps(result, indent=2)
 
 @_tool()
+async def set_footprint_pad_settings(ctx: Context, library_path: str, footprint_name: str,
+                                     pad_names: list[str], mask_expansion_mm: Optional[float] = None,
+                                     paste_expansion_mm: Optional[float] = None, mode: str = "manual") -> str:
+    """Update existing PcbLib pads without saving. All names must match one pad each.
+
+    mode='manual': set the supplied solder mask and/or paste expansions in mm;
+    omitted settings are preserved. mode='rule': reset both overrides to rules,
+    without expansion arguments. Uses TPadCache and verifies the resulting values.
+    Returns before/after settings and verified_count. Geometry and locks are preserved.
+    A timeout can leave partial edits: inspect before retrying.
+    """
+    return await footprint_editor.execute(altium_bridge, EXCHANGE_DIR, "set_footprint_pad_settings",
+                                          footprint_editor.prepare_pads, library_path, footprint_name,
+                                          pad_names, mask_expansion_mm, paste_expansion_mm, mode)
+
+
+@_tool()
+async def edit_footprint_primitives(ctx: Context, library_path: str, footprint_name: str,
+                                    operations: list[dict]) -> str:
+    """Change layers of existing track, arc or fill primitives in a PcbLib; never save.
+
+    Each operation: {"target": {"type":"track", "layer":"No Layer",
+    "x1":0,"y1":0,"x2":100,"y2":0,"width":5}, "layer":"Mechanical 13"}.
+    Copy target geometry from get_footprint_primitives (mils relative to footprint
+    origin). Arc targets require cx,cy,radius,start_angle,end_angle,width,layer;
+    fill targets require x1,y1,x2,y2,rotation,layer. Every selector must match
+    exactly one object. Preflights the entire batch; geometry is preserved.
+    Supports mechanical layers 1..16, including 'Mechanical Layer 13' aliases.
+    This command does not add/delete objects or change their geometry.
+    """
+    return await footprint_editor.execute(altium_bridge, EXCHANGE_DIR, "edit_footprint_primitives",
+                                          footprint_editor.prepare_layers, library_path, footprint_name, operations)
+
+
+@_tool(read_only=True)
+async def get_pcb_api_constants(ctx: Context, names: list[str]) -> str:
+    """Read selected native PCB enum values without arbitrary script evaluation.
+
+    Supported: eRound, eRectangular, eOctagonal, eRoundedRectangular, eCacheManual,
+    eTopLayer, eBottomLayer, eTopOverlay, eBottomOverlay, eMechanical13,
+    eMechanical15, eMultiLayer, eNoLayer. Does not modify or save documents.
+    """
+    return await footprint_editor.execute(altium_bridge, EXCHANGE_DIR, "get_pcb_api_constants",
+                                          footprint_editor.prepare_constants, names)
+
+
+@_tool()
 async def create_footprints_batch(ctx: Context, spec_file: str) -> str:
     """
     Create many PCB footprints in a single Altium script run.
@@ -2099,6 +2151,10 @@ async def create_footprints_batch(ctx: Context, spec_file: str) -> str:
                 get_footprint_primitives (bodies_3d); its rotations and
                 z offset appear only once the library is saved.
 
+    Mechanical aliases (e.g. Mechanical Layer 13) are normalized. Unknown layers
+    are rejected before creating objects; No Layer is not a valid destination.
+    Layer resolution is checked in Altium; mechanical layers 1..16 also have
+    explicit enum fallbacks when String2Layer cannot resolve their names.
     The library is left modified and unsaved; the user saves it.
 
     Returns:
@@ -2108,14 +2164,26 @@ async def create_footprints_batch(ctx: Context, spec_file: str) -> str:
     """
     logger.info(f"Creating footprints batch from {spec_file}")
 
-    response = await altium_bridge.execute_command(
-        "create_footprints_batch",
-        {"spec_file": spec_file}
-    )
+    try:
+        prepared_spec = footprint_editor.prepare_batch_file(spec_file, EXCHANGE_DIR)
+    except (ValueError, TypeError, OSError) as exc:
+        return json.dumps({"success": False, "error": str(exc), "may_have_partial_changes": False})
+    try:
+        response = await altium_bridge.execute_command(
+            "create_footprints_batch", {"spec_file": str(prepared_spec)})
+    except Exception as exc:
+        response = {"success": False, "error": str(exc)}
+    # Keep the request if completion is unknown; it may still be in use.
+    if "result" in response:
+        prepared_spec.unlink(missing_ok=True)
 
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
-        return json.dumps({"success": False, "error": f"Failed batch footprint creation: {error_msg}"})
+        if isinstance(response.get("result"), dict) and response["result"].get("success") is False:
+            return json.dumps(response["result"], indent=2)
+        return json.dumps({"success": False, "error": f"Failed batch footprint creation: {error_msg}",
+                           "outcome_unknown": True, "may_have_partial_changes": True,
+                           "spec_file": str(prepared_spec)})
 
     result = response.get("result", {})
     return json.dumps(result, indent=2) if not isinstance(result, str) else result
@@ -4648,12 +4716,15 @@ def _bring_to_front(hwnd):
 
 
 def _grab_window_image(hwnd, width: int, height: int) -> Image.Image:
-    """Copy a window's pixels, frame included, into an RGB image.
+    """Copy the foreground window from the composed desktop into an RGB image.
 
+    Altium's GPU canvas is absent/corrupted in its window device context.
+    The caller brings the window forward before reading the desktop pixels.
     Every GDI object is released even when a step fails, so a failed capture
     does not leak device contexts or the bitmap.
     """
-    hwnd_dc = win32gui.GetWindowDC(hwnd)
+    left, top, _, _ = win32gui.GetWindowRect(hwnd)
+    hwnd_dc = win32gui.GetDC(0)
     mfc_dc = save_dc = bitmap = None
     try:
         mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
@@ -4661,7 +4732,7 @@ def _grab_window_image(hwnd, width: int, height: int) -> Image.Image:
         bitmap = win32ui.CreateBitmap()
         bitmap.CreateCompatibleBitmap(mfc_dc, width, height)
         save_dc.SelectObject(bitmap)
-        save_dc.BitBlt((0, 0), (width, height), mfc_dc, (0, 0), win32con.SRCCOPY)
+        save_dc.BitBlt((0, 0), (width, height), mfc_dc, (left, top), win32con.SRCCOPY)
         info = bitmap.GetInfo()
         return Image.frombuffer('RGB', (info['bmWidth'], info['bmHeight']),
                                 bitmap.GetBitmapBits(True), 'raw', 'BGRX', 0, 1)
@@ -4673,7 +4744,7 @@ def _grab_window_image(hwnd, width: int, height: int) -> Image.Image:
             win32gui.DeleteObject(bitmap.GetHandle())
         if mfc_dc is not None:
             mfc_dc.DeleteDC()
-        win32gui.ReleaseDC(hwnd, hwnd_dc)
+        win32gui.ReleaseDC(0, hwnd_dc)
 
 
 @_tool(read_only=True)
@@ -4686,7 +4757,8 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
     foreground back.
 
     Args:
-        view_type (str): Type of view to capture - 'pcb' or 'sch'
+        view_type (str): Type of view to capture - pcb, sch, pcblib or schlib.
+            Focus the exact library with open_document first when needed.
         zoom_to (list, optional): List of component designators (e.g. ["U12", "R42"]).
             PCB view only: Altium zooms to the bounding box of these components
             (plus a margin) before the capture, so the components fill the frame.
@@ -4697,6 +4769,10 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
         (window title, size, zoomed component count)
     """
     logger.info(f"Taking screenshot of Altium {view_type} window (zoom_to={zoom_to})")
+    if not isinstance(view_type, str) or view_type.lower() not in ("pcb", "sch", "pcblib", "schlib"):
+        return json.dumps({"success": False, "error": "view_type must be pcb, sch, pcblib or schlib"})
+    if zoom_to and view_type.lower() != "pcb":
+        return json.dumps({"success": False, "error": "zoom_to is supported for PCB views only"})
     previous_window = win32gui.GetForegroundWindow()
 
     try:
@@ -4724,8 +4800,8 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
         focus_info = focus_info if isinstance(focus_info, dict) else {}
         focused_kind = str(focus_info.get("focused_kind", "") or "").upper()
         focused_document = focus_info.get("focused_document", "")
-        wanted_kind = {"pcb": "PCB", "sch": "SCH"}.get(view_type.lower())
-        if wanted_kind and focused_kind and focused_kind != wanted_kind:
+        wanted_kind = {"pcb": "PCB", "sch": "SCH", "pcblib": "PCBLIB", "schlib": "SCHLIB"}[view_type.lower()]
+        if focused_kind != wanted_kind:
             logger.error(f"Requested {view_type} view but {focused_kind} document is focused")
             return json.dumps({
                 "success": False,
@@ -4840,7 +4916,7 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
                 except Exception as e:
                     logger.warning(f"Could not bring window to foreground: {e}")
                 if not activated:
-                    logger.warning("Altium is not the foreground window; the capture may show an unpainted view")
+                    return {"success": False, "error": "Cannot capture Altium: foreground activation was not confirmed"}
                 # A freshly switched-to document needs a moment to render.
                 time.sleep(1.0)
 
@@ -4889,6 +4965,7 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
                         "window_class": window["class_name"],
                         "view_type": view_type,
                         "foreground_confirmed": activated,
+                        "capture_backend": "desktop_compositor",
                         "image_format": "PNG",
                         "debug_file": debug_filename,
                         "image_data": png_bytes

@@ -12,6 +12,10 @@
 
 Tools for developing new Altium API functionality. Not part of the MCP server.
 
+Library operations from the supplied TPS3808 report are mapped to existing and
+new tools in [FOOTPRINT_EDITOR.md](FOOTPRINT_EDITOR.md), including the no-save
+live harness and [passing verification](FOOTPRINT_EDITOR_LIVE_TEST.md).
+
 ## Upstream integration regression
 
 Using the MCP environment's Python, run:

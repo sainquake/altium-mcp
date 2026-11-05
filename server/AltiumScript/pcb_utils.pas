@@ -69,6 +69,7 @@ var
     Matched     : Boolean;
     Shown       : Boolean;
     Problems    : TStringList;
+    LayerError  : String;
 
 
 begin
@@ -96,6 +97,18 @@ begin
     try
         Lines.LoadFromFile(SpecFilePath);
 
+        LayerError := ValidateFootprintBatchLayers(Lines);
+        if LayerError <> '' then
+        begin
+            AddJSONBoolean(ResultProps, 'success', False);
+            AddJSONProperty(ResultProps, 'error', LayerError);
+            AddJSONInteger(ResultProps, 'created', 0);
+            AddJSONBoolean(ResultProps, 'saved', False);
+            AddJSONBoolean(ResultProps, 'may_have_partial_changes', False);
+            Result := BuildJSONObject(ResultProps);
+            Exit;
+        end;
+
         // One undo step for the whole batch; this is also what marks the
         // library as modified (the user saves it)
         PCBServer.PreProcess;
@@ -112,13 +125,14 @@ begin
                     // Stop unless that library is now the focused one -
                     // never work on whatever else is focused
                     LibPath := Trim(GetFieldFromPipeString(Line, 1));
+                    ServerDoc := nil;
                     if FileExists(LibPath) then
                         ServerDoc := OpenLibraryDocument('PcbLib', LibPath);
                     PcbLib := GetPcbLibSafe(0);
                     Matched := False;
                     if (PcbLib <> nil) then
                         Matched := (NormalizedPath(PcbLib.Board.FileName) = NormalizedPath(LibPath));
-                    if not Matched then
+                    if (ServerDoc = nil) or not Matched then
                     begin
                         PCBServer.PostProcess;
                         Result := 'ERROR: Could not open and focus ' + LibPath + ' - nothing was created';
@@ -203,7 +217,7 @@ begin
                                            MilsToCoord(SafeStrToFloat(Trim(GetFieldFromPipeString(Line, 6)))));
                             Body.Model := Model;
                             Body.SetState_FromModel;
-                            Body.Layer := String2Layer(Trim(GetFieldFromPipeString(Line, 2)));
+                            Body.Layer := FootprintEditLayer(Trim(GetFieldFromPipeString(Line, 2)));
                             Body.MoveByXY(OX + MilsToCoord(SafeStrToFloat(Trim(GetFieldFromPipeString(Line, 7)))),
                                           OY + MilsToCoord(SafeStrToFloat(Trim(GetFieldFromPipeString(Line, 8)))));
                             // Added to the footprint itself, a body for the
@@ -239,7 +253,7 @@ begin
                         Pad.Mode := ePadMode_Simple;
                     Pad.x := MilsToCoord(SafeStrToFloat(Trim(GetFieldFromPipeString(Line, 2))));
                     Pad.y := MilsToCoord(SafeStrToFloat(Trim(GetFieldFromPipeString(Line, 3))));
-                    Pad.Layer := String2Layer(Trim(GetFieldFromPipeString(Line, 5)));
+                    Pad.Layer := FootprintEditLayer(Trim(GetFieldFromPipeString(Line, 5)));
                     Pad.Plated := (Trim(GetFieldFromPipeString(Line, 6)) = '1');
                     Pad.HoleSize := MilsToCoord(SafeStrToFloat(Trim(GetFieldFromPipeString(Line, 7))));
                     Pad.HoleType := StrToInt(Trim(GetFieldFromPipeString(Line, 8)));
@@ -281,7 +295,7 @@ begin
                     Track.x2 := MilsToCoord(SafeStrToFloat(Trim(GetFieldFromPipeString(Line, 3))));
                     Track.y2 := MilsToCoord(SafeStrToFloat(Trim(GetFieldFromPipeString(Line, 4))));
                     Track.Width := MilsToCoord(SafeStrToFloat(Trim(GetFieldFromPipeString(Line, 5))));
-                    Track.Layer := String2Layer(Trim(GetFieldFromPipeString(Line, 6)));
+                    Track.Layer := FootprintEditLayer(Trim(GetFieldFromPipeString(Line, 6)));
                     LibComp.AddPCBObject(Track);
                     PCBServer.SendMessageToRobots(LibComp.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, Track.I_ObjectAddress);
                 end
@@ -294,7 +308,7 @@ begin
                     Arc.StartAngle := SafeStrToFloat(Trim(GetFieldFromPipeString(Line, 4)));
                     Arc.EndAngle := SafeStrToFloat(Trim(GetFieldFromPipeString(Line, 5)));
                     Arc.LineWidth := MilsToCoord(SafeStrToFloat(Trim(GetFieldFromPipeString(Line, 6))));
-                    Arc.Layer := String2Layer(Trim(GetFieldFromPipeString(Line, 7)));
+                    Arc.Layer := FootprintEditLayer(Trim(GetFieldFromPipeString(Line, 7)));
                     LibComp.AddPCBObject(Arc);
                     PCBServer.SendMessageToRobots(LibComp.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, Arc.I_ObjectAddress);
                 end
@@ -306,7 +320,7 @@ begin
                     Fill.x2Location := MilsToCoord(SafeStrToFloat(Trim(GetFieldFromPipeString(Line, 3))));
                     Fill.y2Location := MilsToCoord(SafeStrToFloat(Trim(GetFieldFromPipeString(Line, 4))));
                     Fill.Rotation := SafeStrToFloat(Trim(GetFieldFromPipeString(Line, 5)));
-                    Fill.Layer := String2Layer(Trim(GetFieldFromPipeString(Line, 6)));
+                    Fill.Layer := FootprintEditLayer(Trim(GetFieldFromPipeString(Line, 6)));
                     LibComp.AddPCBObject(Fill);
                     PCBServer.SendMessageToRobots(LibComp.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, Fill.I_ObjectAddress);
                 end
@@ -317,8 +331,8 @@ begin
                     Via.y := MilsToCoord(SafeStrToFloat(Trim(GetFieldFromPipeString(Line, 2))));
                     Via.Size := MilsToCoord(SafeStrToFloat(Trim(GetFieldFromPipeString(Line, 3))));
                     Via.HoleSize := MilsToCoord(SafeStrToFloat(Trim(GetFieldFromPipeString(Line, 4))));
-                    Via.LowLayer := String2Layer(Trim(GetFieldFromPipeString(Line, 5)));
-                    Via.HighLayer := String2Layer(Trim(GetFieldFromPipeString(Line, 6)));
+                    Via.LowLayer := FootprintEditLayer(Trim(GetFieldFromPipeString(Line, 5)));
+                    Via.HighLayer := FootprintEditLayer(Trim(GetFieldFromPipeString(Line, 6)));
                     LibComp.AddPCBObject(Via);
                     PCBServer.SendMessageToRobots(LibComp.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, Via.I_ObjectAddress);
                 end
@@ -334,7 +348,7 @@ begin
                         V := V + 2;
                     end;
                     Region.SetOutlineContour(Contour);
-                    Region.Layer := String2Layer(Trim(GetFieldFromPipeString(Line, 1)));
+                    Region.Layer := FootprintEditLayer(Trim(GetFieldFromPipeString(Line, 1)));
                     Region.Kind := StrToInt(Trim(GetFieldFromPipeString(Line, 2)));
                     LibComp.AddPCBObject(Region);
                     PCBServer.SendMessageToRobots(LibComp.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, Region.I_ObjectAddress);
@@ -346,7 +360,7 @@ begin
                     Text.YLocation := MilsToCoord(SafeStrToFloat(Trim(GetFieldFromPipeString(Line, 2))));
                     Text.Size := MilsToCoord(SafeStrToFloat(Trim(GetFieldFromPipeString(Line, 3))));
                     Text.Width := MilsToCoord(SafeStrToFloat(Trim(GetFieldFromPipeString(Line, 4))));
-                    Text.Layer := String2Layer(Trim(GetFieldFromPipeString(Line, 6)));
+                    Text.Layer := FootprintEditLayer(Trim(GetFieldFromPipeString(Line, 6)));
                     Text.MirrorFlag := (Trim(GetFieldFromPipeString(Line, 7)) = '1');
                     Text.UseTTFonts := (Trim(GetFieldFromPipeString(Line, 8)) = '1');
                     // <NL> placeholder carries embedded newlines through the
@@ -448,6 +462,11 @@ begin
         Exit;
     end;
 
+    if (LibraryPath <> '') and (NormalizedPath(PcbLib.Board.FileName) <> NormalizedPath(LibraryPath)) then
+    begin
+        Result := 'ERROR: Focused PCB library identity mismatch';
+        Exit;
+    end;
     ResultProps := TStringList.Create;
     FPArray := TStringList.Create;
     Found := False;
@@ -455,6 +474,8 @@ begin
     try
         AddJSONProperty(ResultProps, 'library_name', ExtractFileName(PcbLib.Board.FileName));
         AddJSONProperty(ResultProps, 'library_path', PcbLib.Board.FileName);
+        AddJSONNumber(ResultProps, 'library_origin_x', CoordToMils(PcbLib.Board.XOrigin));
+        AddJSONNumber(ResultProps, 'library_origin_y', CoordToMils(PcbLib.Board.YOrigin));
 
         for C := 0 to PcbLib.ComponentCount - 1 do
         begin
@@ -566,6 +587,11 @@ begin
                                     AddJSONNumber(PrimProps, 'paste_expansion', CoordToMils(Prim.PasteMaskExpansion));
                                     AddJSONInteger(PrimProps, 'mask_mode', Prim.SolderMaskExpansionMode);
                                     AddJSONNumber(PrimProps, 'mask_expansion', CoordToMils(Prim.SolderMaskExpansion));
+                                    try
+                                        PrimProps.Add('"pad_settings": ' + FootprintEditPadSnapshot(Prim));
+                                    except
+                                        AddJSONBoolean(PrimProps, 'cache_readable', False);
+                                    end;
                                     AddJSONBoolean(PrimProps, 'locked', not Prim.Moveable);
                                 end;
                                 eTrackObject:

@@ -22,33 +22,54 @@ The initial project already had Modified `Supply.SchDoc` and
 `Power-Sequencer-Draft.SchDoc`. Originals were never clone targets. No save or
 compile command was issued. All source/target fixture edits were in memory.
 
-## Pending multipart verification
+## Initial interrupted multipart run
 
 The `M1` test on SoM.SchDoc selected placed parts 1, 3, 4, 6 and 7. The native log
 recorded registration of all five copies into a unique unsaved scratch target,
 then the bridge timed out before a complete response. Altium remained busy.
 The mutation was not retried, and Altium was not terminated because it holds
-unsaved user data. Final source/target readback and scratch cleanup are pending.
+unsaved user data. Final source/target readback and scratch cleanup were not
+obtained for that interrupted run.
 
 An unnecessary whole-response `DocumentJSON` pass was removed: the common
 `JSONEscapeString` already escapes Unicode per value, and rebuilding a large
 string character by character can be quadratic. Progress heartbeats and stage
-logs were added. This correction passed offline tests; its multipart performance
-must still be verified live after the running old invocation completes.
+logs were added. This correction passed offline tests and the subsequent live
+run below.
 
 Evidence and exact recovery state are stored centrally in
 `.altium-mcp/schematic_cloning_20261105_220451/`, including per-call responses,
 `recovery_state.json`, original project/sheet snapshots and the retained spec
 path. The incomplete run must not be reported as a fully passing live test.
 
-Before retrying: wait for a responsive executor, inspect any late response and
-the exact scratch destination, verify source state, then close only the recorded
-scratch buffers without saving. Do not repeat an unknown-outcome clone blindly.
+The user's machine restart ended that invocation. The next run used new unique
+scratch documents; it did not retry into the previous unknown-outcome target.
+
+## Completed after restart
+
+The fresh 2026-11-05 run passed, including the complete multipart case:
+
+- All five placed `M1` sections (1, 3, 4, 6 and 7) copied successfully, with fresh
+  root/owned-object UIDs and verified metadata, pin and primitive preservation.
+- Source readback and Modified state remained unchanged. Ordinary two-component
+  copies preserved unsaved Unicode/parameter/pose edits; missing selectors and
+  target collisions rejected with zero copies.
+- A named unsaved destination received copies without a SchDoc being written.
+- All four scratch buffers were closed with explicit discard. Read-only sources
+  originally closed were closed cleanly again. Original project states, original
+  file hashes/mtimes and scratch-copy disk content were unchanged.
+
+Evidence: `.altium-mcp/schematic_cloning_20261105_233600/report.json`, with
+`checks_passed`, `original_states_unchanged`, `original_disk_unchanged`,
+`scratch_disk_unchanged` and `unsaved_targets_not_written` all true.
+The original project had no Modified documents after reboot, so the earlier
+dirty-original Supply test was not repeated; a dirty scratch source was tested.
+No save or compile command was issued.
 
 ## Reproduce
 
 ```powershell
-python dev/test_schematic_cloning_live.py --project "C:/Design/Controller/Controller.PrjPcb" --multipart-sheet "C:/Design/Controller/SoM.SchDoc" --multipart-designator M1 --exercise
+python dev/test_schematic_cloning_live.py --project "C:/Design/Controller/Controller.PrjPcb" --source "C:/Design/Controller/Display.SchDoc" --multipart-sheet "C:/Design/Controller/SoM.SchDoc" --multipart-designator M1 --exercise
 ```
 
 The harness copies saved sources into a unique toolkit `.altium-mcp` directory,
@@ -66,4 +87,4 @@ trees because existing tools could not clone from an explicit different source
 sheet. The probes succeeded and informed
 `clone_schematic_components(source_sheet, target_sheet, designators)`.
 Implementation tests called the new Python wrapper and existing dedicated tools;
-the large multipart invocation has the pending outcome described above.
+the initial large multipart invocation was interrupted; the new run passed.
