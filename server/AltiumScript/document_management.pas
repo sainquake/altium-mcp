@@ -483,3 +483,242 @@ begin
             Exit;
         end;
 end;
+
+function ClosePathIndex(Paths: TStringList; Path: String): Integer;
+var
+    I: Integer;
+begin
+    Result := -1;
+    for I := 0 to Paths.Count - 1 do
+        if NormalizedPath(Paths[I]) = NormalizedPath(Path) then
+        begin
+            Result := I;
+            Exit;
+        end;
+end;
+
+function CloseScriptPath(Path: String): Boolean;
+var
+    Extension: String;
+begin
+    Extension := LowerCase(ExtractFileExt(Path));
+    Result := (Extension = '.prjscr') or (Extension = '.pas') or
+              (Extension = '.dfm') or (Extension = '.vbs') or (Extension = '.js');
+end;
+
+procedure CloseAddOpenPath(Paths: TStringList; Path: String);
+begin
+    if (FindOpenDocument(Path) <> nil) and (ClosePathIndex(Paths, Path) < 0) then
+        Paths.Add(Path);
+end;
+
+function ClosePathsJSON(Paths: TStringList): String;
+var
+    Values: TStringList;
+    I: Integer;
+begin
+    Values := TStringList.Create;
+    try
+        for I := 0 to Paths.Count - 1 do Values.Add('"' + JSONEscapeString(Paths[I]) + '"');
+        Result := BuildJSONArray(Values);
+    finally
+        Values.Free;
+    end;
+end;
+
+procedure CloseOutsidePaths(Paths, Affected: TStringList);
+var
+    I, J: Integer;
+    Module: IServerModule;
+    Path: String;
+begin
+    for I := 0 to Client.Count - 1 do
+    begin
+        Module := Client.ServerModule[I];
+        if Module <> nil then
+            for J := 0 to Module.DocumentCount - 1 do
+            begin
+                Path := Module.Documents[J].FileName;
+                if not CloseScriptPath(Path) and (ClosePathIndex(Affected, Path) < 0) then
+                    CloseAddOpenPath(Paths, Path);
+            end;
+    end;
+end;
+
+function CloseDocumentFromSpec(SpecPath: String): String;
+var
+    Spec, Props, Affected, Dirty, Cleared, ClosedPaths, Discarded, Remaining, Outside: TStringList;
+    Doc: IServerDocument;
+    Project: IProject;
+    Path, Extension, ErrorText, BeforeState, OutsideBefore, OutsideAfter: String;
+    I: Integer;
+    RequireClean, IsProject, AlreadyClosed, Started, TargetClosed, WasModified: Boolean;
+begin
+    Result := 'ERROR: close_document spec file not found';
+    if not FileExists(SpecPath) then Exit;
+    Spec := TStringList.Create;
+    Props := TStringList.Create;
+    Affected := TStringList.Create;
+    Dirty := TStringList.Create;
+    Cleared := TStringList.Create;
+    ClosedPaths := TStringList.Create;
+    Discarded := TStringList.Create;
+    Remaining := TStringList.Create;
+    Outside := TStringList.Create;
+    ErrorText := '';
+    BeforeState := '[]';
+    OutsideBefore := '[]';
+    OutsideAfter := '[]';
+    Started := False;
+    RequireClean := True;
+    IsProject := False;
+    AlreadyClosed := False;
+    WasModified := False;
+    Path := '';
+    try
+        Spec.LoadFromFile(SpecPath);
+        Path := JSONUnescape(Spec.Values['document_path']);
+        Extension := LowerCase(ExtractFileExt(Path));
+        try
+          repeat
+            if (Path = '') or CloseScriptPath(Path) then
+                begin ErrorText := 'script documents/projects cannot be closed by this tool'; Break; end;
+            if (Spec.Values['require_clean'] <> '0') and (Spec.Values['require_clean'] <> '1') then
+                begin ErrorText := 'require_clean must be 0 or 1'; Break; end;
+            RequireClean := Spec.Values['require_clean'] = '1';
+            Project := DocumentProject(Path);
+            IsProject := (Project <> nil) or (Extension = '.prjpcb') or (Extension = '.libpkg');
+            if (Project <> nil) and (Extension <> '.prjpcb') and (Extension <> '.libpkg') then
+                begin ErrorText := 'only PrjPcb and LibPkg projects are supported'; Break; end;
+            Doc := FindOpenDocument(Path);
+            AlreadyClosed := (Doc = nil) and (Project = nil);
+            if not AlreadyClosed then
+            begin
+                if Doc = nil then
+                    begin ErrorText := 'cannot read the open target Modified flag; refusing to close'; Break; end;
+                if IsProject and (Project = nil) then
+                    begin ErrorText := 'project workspace identity could not be verified'; Break; end;
+                WasModified := Doc.Modified;
+                if IsProject then
+                begin
+                    // Snapshot all open source/generated documents before ANY close.
+                    for I := 0 to Project.DM_LogicalDocumentCount - 1 do
+                        CloseAddOpenPath(Affected, Project.DM_LogicalDocuments(I).DM_FullPath);
+                    for I := 0 to Project.DM_GeneratedDocumentCount - 1 do
+                        CloseAddOpenPath(Affected, Project.DM_GeneratedDocuments(I).DM_FullPath);
+                end;
+                // The project closes last; all references are looked up afresh.
+                CloseAddOpenPath(Affected, Path);
+            end;
+            BeforeState := ExistingOpenDocumentStates(Affected);
+            CloseOutsidePaths(Outside, Affected);
+            OutsideBefore := ExistingOpenDocumentStates(Outside);
+            for I := 0 to Affected.Count - 1 do
+            begin
+                if CloseScriptPath(Affected[I]) then
+                    begin ErrorText := 'project contains open script documents; refusing to close'; Break; end;
+                Doc := FindOpenDocument(Affected[I]);
+                if Doc = nil then
+                    begin ErrorText := 'affected document disappeared during preflight'; Break; end;
+                if Doc.BeingClosed then
+                    begin ErrorText := 'an affected document is already closing'; Break; end;
+                if Doc.Modified then Dirty.Add(Affected[I]);
+            end;
+            if ErrorText <> '' then Break;
+            if RequireClean and (Dirty.Count > 0) then
+                begin ErrorText := 'target or project documents have unsaved changes'; Break; end;
+            if (Affected.Count > 0) and (SchServer.ProcessControl.ProcessDepth <> 0) then
+                begin ErrorText := 'schematic editor has an active transaction'; Break; end;
+            if not RequireClean then
+                for I := 0 to Dirty.Count - 1 do
+                begin
+                    Doc := FindOpenDocument(Dirty[I]);
+                    Started := True;
+                    Cleared.Add(Dirty[I]);
+                    Doc.SetModified(False);
+                end;
+            for I := 0 to Affected.Count - 1 do
+            begin
+                Doc := FindOpenDocument(Affected[I]);
+                if Doc <> nil then
+                begin
+                    // A newly dirty document must never reach the save prompt.
+                    if Doc.Modified then
+                        begin ErrorText := 'document became modified after preflight'; Break; end;
+                    LogScriptError('close_document: close exact handle ' + Affected[I]);
+                    Started := True;
+                    Client.CloseDocument(Doc);
+                    Doc := nil;  // Never dereference a closed/freed interface.
+                end;
+                if FindOpenDocument(Affected[I]) <> nil then
+                    begin ErrorText := 'Altium did not close an affected document'; Break; end;
+            end;
+          until True;
+        except
+            ErrorText := ExceptionMessage;
+        end;
+        // Restore only Modified flags cleared by this request on surviving buffers.
+        for I := 0 to Cleared.Count - 1 do
+        begin
+            Doc := FindOpenDocument(Cleared[I]);
+            if Doc <> nil then Doc.SetModified(True);
+        end;
+        for I := 0 to Affected.Count - 1 do
+            if FindOpenDocument(Affected[I]) <> nil then Remaining.Add(Affected[I])
+            else
+            begin
+                ClosedPaths.Add(Affected[I]);
+                if ClosePathIndex(Cleared, Affected[I]) >= 0 then Discarded.Add(Affected[I]);
+            end;
+        Project := DocumentProject(Path);
+        TargetClosed := (FindOpenDocument(Path) = nil) and (Project = nil);
+        if (ErrorText = '') and not TargetClosed then ErrorText := 'target closure readback failed';
+        if (ErrorText = '') and (Remaining.Count > 0) then ErrorText := 'some affected documents remain open';
+        OutsideAfter := ExistingOpenDocumentStates(Outside);
+        if (ErrorText = '') and (OutsideBefore <> OutsideAfter) then ErrorText := 'unrelated document states changed';
+        AddJSONBoolean(Props, 'success', ErrorText = '');
+        AddJSONProperty(Props, 'document_path', Path);
+        AddJSONBoolean(Props, 'is_project', IsProject);
+        AddJSONBoolean(Props, 'require_clean', RequireClean);
+        AddJSONBoolean(Props, 'closed', TargetClosed);
+        AddJSONBoolean(Props, 'already_closed', AlreadyClosed);
+        AddJSONBoolean(Props, 'changed', ClosedPaths.Count > 0);
+        AddJSONBoolean(Props, 'was_modified', WasModified);
+        AddJSONBoolean(Props, 'saved', False);
+        AddJSONBoolean(Props, 'project_saved', False);
+        AddJSONBoolean(Props, 'may_have_partial_changes', Started and (ErrorText <> ''));
+        AddJSONBoolean(Props, 'close_outcome_unknown', False);
+        AddJSONBoolean(Props, 'unrelated_documents_preserved', OutsideBefore = OutsideAfter);
+        Props.Add('"affected_documents": ' + BeforeState);
+        Props.Add('"closed_paths": ' + ClosePathsJSON(ClosedPaths));
+        Props.Add('"discarded_paths": ' + ClosePathsJSON(Discarded));
+        Props.Add('"remaining_open_paths": ' + ClosePathsJSON(Remaining));
+        if RequireClean then Props.Add('"blocked_paths": ' + ClosePathsJSON(Dirty))
+        else Props.Add('"blocked_paths": []');
+        if ErrorText <> '' then AddJSONProperty(Props, 'error', ErrorText);
+        Result := DocumentJSON(BuildJSONObject(Props));
+    finally
+        Spec.Free;
+        Props.Free;
+        Affected.Free;
+        Dirty.Free;
+        Cleared.Free;
+        ClosedPaths.Free;
+        Discarded.Free;
+        Remaining.Free;
+        Outside.Free;
+    end;
+end;
+
+function ExecuteCloseDocument(Request: TStringList): String;
+var
+    I: Integer;
+begin
+    Result := 'ERROR: close_document spec_file is required';
+    for I := 0 to Request.Count - 1 do
+        if Pos('"spec_file":', Request[I]) > 0 then
+        begin
+            Result := CloseDocumentFromSpec(JSONLineValue(Request[I]));
+            Exit;
+        end;
+end;

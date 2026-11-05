@@ -40,6 +40,7 @@ import schematic_connectivity
 import library_component_data
 import symbol_metadata
 import document_management
+import document_closing
 import project_selection
 import lcsc_catalog
 from server_info import capture_runtime_info
@@ -161,7 +162,7 @@ MUTATING_COMMANDS = {
     "create_footprints_batch", "layout_duplicator", "layout_duplicator_apply",
     "run_output_jobs", "create_pcb_footprint", "edit_schematic", "edit_schematic_actions",
     "set_library_component_data", "create_document", "open_document", "save_document",
-    "add_document_to_project", "open_project", "select_project",
+    "add_document_to_project", "open_project", "select_project", "close_document",
 }
 
 # Present while a script the MCP launched is stuck (paused in Altium's
@@ -2483,6 +2484,23 @@ async def set_library_component_data(ctx: Context, library_path: str, symbol_nam
     finally:
         if 'response' in locals() and response.get("success", False):
             spec_path.unlink(missing_ok=True)
+
+
+@_tool()
+async def close_document(ctx: Context, document_path: str, require_clean: bool = True) -> str:
+    """Close one exact open document or PrjPcb/LibPkg by absolute path; never save.
+
+    require_clean=True refuses a modified target. For a project, preflight also
+    checks all its open source/generated documents before closing any of them,
+    then closes those documents and the project. False explicitly DISCARDS their
+    unsaved changes; use only when discarding is authorized. Already-closed or
+    missing targets succeed idempotently without opening files. Closing one editor
+    does not remove its saved source membership. Script documents/projects are
+    unsupported. Returns affected/closed/discarded/remaining paths and verifies
+    unrelated open documents retain their state. API errors can leave a partial
+    close; inspect may_have_partial_changes/close_outcome_unknown before retrying.
+    """
+    return await document_closing.execute(altium_bridge, EXCHANGE_DIR, document_path, require_clean)
 
 
 @_tool()

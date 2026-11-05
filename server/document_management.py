@@ -16,7 +16,7 @@ KINDS = {".schdoc": "SCH", ".pcbdoc": "PCB", ".schlib": "SCHLIB", ".pcblib": "PC
 PROJECT_EXTENSIONS = {".prjpcb", ".libpkg"}
 
 
-def absolute_path(value, extensions):
+def absolute_path(value, extensions=None, require_parent=True):
     if not isinstance(value, str) or not value or any(ord(c) < 32 for c in value):
         raise ValueError("path must be a nonempty string without control characters")
     win = PureWindowsPath(value)
@@ -28,9 +28,9 @@ def absolute_path(value, extensions):
                 re.fullmatch(r"(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", part)):
             raise ValueError("path contains an unsafe Windows filename")
     path = Path(value).resolve()
-    if path.suffix.lower() not in extensions:
+    if extensions is not None and path.suffix.lower() not in extensions:
         raise ValueError("unsupported extension; expected " + ", ".join(sorted(extensions)))
-    if not path.parent.is_dir():
+    if require_parent and not path.parent.is_dir():
         raise ValueError("parent directory must already exist")
     if path.exists() and not path.is_file():
         raise ValueError("path must identify a file")

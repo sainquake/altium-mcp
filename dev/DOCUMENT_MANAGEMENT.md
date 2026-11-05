@@ -15,6 +15,7 @@ The following tools now cover explicit file creation, saving and project inclusi
 | `create_document(document_path, document_kind=None)` | Create a named document in Free Documents, without writing a file. |
 | `open_document(document_path)` | Open/focus an existing document, reusing it without reloading when already open. |
 | `save_document(document_path, dry_run=False)` | Save only that exact open document to its assigned filename. |
+| [`close_document(document_path, require_clean=True)`](CLOSE_DOCUMENT.md) | Close one exact editor or PrjPcb/LibPkg, checking unsaved changes first; never save. |
 | `add_document_to_project(project_path, document_path)` | Include one document in one exact open project, without saving either. |
 
 Supported documents: `.SchDoc` / `SCH`, `.PcbDoc` / `PCB`, `.SchLib` / `SCHLIB`,
@@ -22,6 +23,10 @@ Supported documents: `.SchDoc` / `SCH`, `.PcbDoc` / `PCB`, `.SchLib` / `SCHLIB`,
 already exist. Creation/saving require local storage, including rejection of
 mapped network drives. Read-only targets are rejected. Document kind is inferred
 from the extension; an explicit kind must match it, case-insensitively.
+
+Closing has its own scope and validation: it also supports projects and other
+loaded editor kinds, and accepts targets whose disk file/directory no longer exists.
+See [close policy and explicit discard behavior](CLOSE_DOCUMENT.md).
 
 ## Examples
 
@@ -76,7 +81,7 @@ not select a project. Selection does not save a project or its documents.
 
 ## Results and failures
 
-All tools return `success`, `action`, `document_path`, `document_kind`, `changed`,
+Creation/opening/saving/inclusion return `success`, `action`, `document_path`, `document_kind`, `changed`,
 `saved`, `exists_on_disk` and `may_have_partial_changes` for native responses.
 Validation errors contain `success=false`, `error` and `saved=false`.
 An open target also reports `was_modified` / `is_modified`.

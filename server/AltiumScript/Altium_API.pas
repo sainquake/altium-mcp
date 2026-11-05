@@ -1285,7 +1285,7 @@ begin
     else if (CommandName <> 'edit_schematic') and (CommandName <> 'get_schematic_connectivity') and
        (CommandName <> 'set_library_component_data') and
        (CommandName <> 'create_document') and (CommandName <> 'save_document') and
-       (CommandName <> 'open_document') and (CommandName <> 'open_project') and
+       (CommandName <> 'open_document') and (CommandName <> 'open_project') and (CommandName <> 'close_document') and
        (CommandName <> 'add_document_to_project') and (CommandName <> 'select_project') and not (((CommandName = 'get_output_job_containers') or
              (CommandName = 'run_output_jobs')) and
             (RequestOutJobPath(RequestData) <> '')) then
@@ -1362,6 +1362,8 @@ begin
             Result := ExecuteLibraryComponentData(RequestData);
         'create_document', 'open_document', 'save_document', 'add_document_to_project':
             Result := ExecuteManageDocument(CommandName, RequestData);
+        'close_document':
+            Result := ExecuteCloseDocument(RequestData);
         'open_project':
             Result := ExecuteOpenProject(RequestData);
         'select_project':
@@ -1624,7 +1626,7 @@ begin
                 // Exact project selection must not invoke the legacy fallback,
                 // which can show another project's document before validation.
                 if (CommandType <> 'select_project') and (CommandType <> 'open_project') and
-                   (CommandType <> 'open_document') then EnsureDesignProjectFocused();
+                   (CommandType <> 'open_document') and (CommandType <> 'close_document') then EnsureDesignProjectFocused();
                 Result := ExecuteCommand(CommandType);
                 // Remember an explicitly selected project for later recovery.
                 // This writes only the toolkit's context hint, never a design file.
