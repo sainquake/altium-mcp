@@ -32,9 +32,12 @@ class SchematicEditTest(unittest.TestCase):
 
     def test_read_only_and_exact_path(self):
         self.assertIn("count=0\n", self.validate([]))
-        for path in ("test.SchDoc", str(self.sheet.with_suffix(".SchLib")), str(self.sheet.parent / "missing.SchDoc")):
+        for path in ("test.SchDoc", str(self.sheet.with_suffix(".SchLib"))):
             with self.subTest(path=path), self.assertRaises(ValueError):
                 validate_request(path, [])
+        # Only Altium can distinguish an open unsaved document from a missing
+        # closed path. Native preflight must make that decision without creation.
+        self.assertIn("count=0", validate_request(str(self.sheet.parent / "unsaved.SchDoc"), []))
 
     def test_transport_keeps_unicode_delimiters_and_line_breaks(self):
         value = "\u0422\u0435\u0441\u0442 | , = \\\n\r\t\"'"

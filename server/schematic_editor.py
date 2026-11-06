@@ -3,11 +3,13 @@
 import json
 import math
 from pathlib import Path, PureWindowsPath
+from collections import Counter
+from document_management import absolute_path
 
 
 FIELDS = {
     "component": {"x", "y", "orientation", "mirror", "designator", "comment",
-                  "description", "parameters", "source_designator", "symbol_library", "symbol"},
+                  "description", "design_item_id", "parameters", "source_designator", "symbol_library", "symbol"},
     "wire": {"points"},
     "net_label": {"x", "y", "text", "orientation"},
     "port": {"x", "y", "name", "io_type", "style", "width"},
@@ -39,10 +41,7 @@ def validate_request(sheet_path, operations):
     in the line-oriented TStringList transport. Files are written with a BOM.
     """
     _text(sheet_path, "sheet_path", True)
-    if not PureWindowsPath(sheet_path).is_absolute() or Path(sheet_path).suffix.lower() != ".schdoc":
-        raise ValueError("sheet_path must be an absolute path to an existing .SchDoc")
-    if not Path(sheet_path).is_file():
-        raise ValueError(f"schematic file not found: {sheet_path}")
+    sheet_path = str(absolute_path(sheet_path, {".schdoc"}))
     if not isinstance(operations, list) or len(operations) > 500:
         raise ValueError("operations must be a list of at most 500 operations")
     spec = {"sheet_path": str(Path(sheet_path).resolve()), "count": len(operations)}
@@ -128,3 +127,16 @@ def validate_request(sheet_path, operations):
                 raise ValueError(f"symbol_library must be an existing .SchLib: {value}")
             spec[prefix + key] = int(value) if isinstance(value, bool) else value
     return "\n".join(f"{key}={json.dumps(str(value), ensure_ascii=False)[1:-1]}" for key, value in spec.items()) + "\n"
+
+
+def compact_result(result, mode):
+    """Reduce client output; native full snapshots still support verification."""
+    result = dict(result)
+    objects = result.pop("objects", [])
+    result["return_mode"] = mode
+    result["object_count"] = len(objects)
+    result["object_counts"] = dict(Counter(obj["type"] for obj in objects))
+    if mode == "changed":
+        changed = {row["unique_id"] for row in result.get("results", []) if row.get("unique_id")}
+        result["objects"] = [obj for obj in objects if obj.get("unique_id") in changed]
+    return result

@@ -1,4 +1,4 @@
-# edit_schematic(sheet_path, operations, unit="mil", save=False)
+# edit_schematic(sheet_path, operations, unit="mil", save=False, return_mode="full")
 
 The UID operation format below adds, updates and deletes objects in memory.
 It always uses mils and requires `save=False`; it never clears Modified. A sheet may retain its `*` marker
@@ -24,6 +24,15 @@ edit_schematic(
 )
 ```
 
+Each action includes `op`; x/y are always a pair. For example:
+
+```python
+edit_schematic(sheet_path, [
+    {"op": "add_wire", "points": [[1000, 1000], [1500, 1000]]},
+    {"op": "move_text", "designator": "R1", "name": "Comment", "x": 1200, "y": 900},
+], unit="mil", save=False)
+```
+
 Action operations run in order in one undo group; inspect `errors` for partial
 failures. UID operations preflight all targets and report `applied_count`,
 `failed_index` and `may_have_partial_changes`. Do not mix formats in a batch.
@@ -40,16 +49,25 @@ edit_schematic(
 )
 ```
 
-The path must be absolute and identify an existing `.SchDoc`. A closed sheet
-is opened; an already open sheet is reused with its unsaved changes. Focus on
+The path must be absolute and identify a saved `.SchDoc` or an already-open named
+unsaved SchDoc created by `create_document`. A missing closed target is rejected
+without creation. A saved closed sheet is opened; an already open sheet is reused.
+Focus on
 another sheet/library does not change the target. Libraries and other file
 types are rejected.
 
 `objects` contains supported top-level objects with `type`, `unique_id`, `x`,
 `y` and type-specific properties. Components include `designator`, `symbol`,
-`comment`, `description`, `orientation`, `mirror`, `parameters` and `pins`.
+`comment`, `description`, `design_item_id`, `orientation`, `mirror`, `parameters` and `pins`.
 Pin records contain numbers, names and absolute **electrical connection
-points**, not their body-end coordinates. Wires include their full `points` array.
+points**, not their body-end coordinates. All pin coordinates are in mils,
+including editor fallback and clone hot-end coordinates. Wires include their full `points` array.
+
+UID operations accept `return_mode="summary"` (status, results and object counts)
+or `"changed"` (only surviving objects affected by this call). Default `"full"`
+preserves the complete response. Native verification snapshots are still built;
+compact modes reduce client output. Action-format calls require `"full"`.
+Use `design_item_id=""` to explicitly detach a copied prototype's DesignItemID.
 
 Use `target={"unique_id": "..."}` from a fresh response for that sheet.
 Components also accept `target={"designator": "R1"}`. A selector must have
@@ -79,7 +97,7 @@ ambiguous designators, including multipart components, use the instance UID.
 
 | type | properties | Required for add |
 | --- | --- | --- |
-| `component` | `x`, `y`, `designator`, `comment`, `description`, `orientation`, `mirror` (bool), `parameters` (string dictionary) | `x`, `y`, `designator`, symbol source |
+| `component` | `x`, `y`, `designator`, `comment`, `description`, `design_item_id`, `orientation`, `mirror` (bool), `parameters` (string dictionary) | `x`, `y`, `designator`, symbol source |
 | `wire` | `points`: flat `[x1,y1,x2,y2,...]` array, 2-1000 points | `points` |
 | `net_label` | `x`, `y`, `text`, `orientation` | `x`, `y`, `text` |
 | `port` | `x`, `y`, `name`, `io_type` (0-3), `style` (0-7), `width` > 0 | `x`, `y`, `name` |

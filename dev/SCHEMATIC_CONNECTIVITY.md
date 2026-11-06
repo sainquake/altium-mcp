@@ -8,6 +8,11 @@ Returns active pin numbers, electrical connection coordinates and actual
 compiled net names for one schematic sheet. Optionally checks expected
 connections. Never edits or saves sheets or clears their Modified flag.
 
+All returned coordinates are mils, including editor fallback for missing compiler
+pins. The previous internal-unit leak in fallback/UID/clone pin snapshots was
+corrected and verified against all 79 pins in the power sequencer draft; see
+[script replacements and live evidence](POWER_SEQUENCER_SCRIPT_REPLACEMENTS.md).
+
 ## Existing alternatives
 
 | Tool | Provides | Missing capability |

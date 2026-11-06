@@ -1286,6 +1286,8 @@ begin
        (CommandName <> 'set_library_component_data') and (CommandName <> 'clone_schematic_components') and
        (CommandName <> 'set_footprint_pad_settings') and (CommandName <> 'edit_footprint_primitives') and
        (CommandName <> 'get_pcb_api_constants') and
+       (CommandName <> 'set_schematic_sheet_properties') and (CommandName <> 'zoom_schematic') and
+       (CommandName <> 'save_project') and
        (CommandName <> 'create_document') and (CommandName <> 'save_document') and
        (CommandName <> 'open_document') and (CommandName <> 'open_project') and (CommandName <> 'close_document') and
        (CommandName <> 'add_document_to_project') and (CommandName <> 'select_project') and not (((CommandName = 'get_output_job_containers') or
@@ -1370,6 +1372,8 @@ begin
             Result := ExecuteCloneSchematicComponents(RequestData);
         'set_footprint_pad_settings', 'edit_footprint_primitives', 'get_pcb_api_constants':
             Result := ExecuteFootprintLibraryCommand(CommandName, RequestData);
+        'set_schematic_sheet_properties', 'zoom_schematic', 'save_project':
+            Result := ExecuteSchematicDocumentCommand(CommandName, RequestData);
         'open_project':
             Result := ExecuteOpenProject(RequestData);
         'select_project':
@@ -1635,7 +1639,9 @@ begin
                    (CommandType <> 'open_document') and (CommandType <> 'close_document') and
                    (CommandType <> 'clone_schematic_components') and
                    (CommandType <> 'set_footprint_pad_settings') and (CommandType <> 'edit_footprint_primitives') and
-                   (CommandType <> 'get_pcb_api_constants') then EnsureDesignProjectFocused();
+                   (CommandType <> 'get_pcb_api_constants') and
+                   (CommandType <> 'set_schematic_sheet_properties') and (CommandType <> 'zoom_schematic') and
+                   (CommandType <> 'save_project') then EnsureDesignProjectFocused();
                 Result := ExecuteCommand(CommandType);
                 // Remember an explicitly selected project for later recovery.
                 // This writes only the toolkit's context hint, never a design file.

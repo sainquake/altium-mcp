@@ -112,8 +112,8 @@ begin
                                 AddJSONProperty(PinProps, 'pin_number', Pin.Designator);
                                 AddJSONProperty(PinProps, 'pin_name', Pin.Name);
                                 AddJSONInteger(PinProps, 'part_id', Pin.OwnerPartId);
-                                AddJSONInteger(PinProps, 'x', X);
-                                AddJSONInteger(PinProps, 'y', Y);
+                                AddJSONNumber(PinProps, 'x', CoordToMils(X));
+                                AddJSONNumber(PinProps, 'y', CoordToMils(Y));
                                 SheetPins.Add(BuildJSONObject(PinProps));
                             finally
                                 PinProps.Free;

@@ -142,6 +142,7 @@ begin
                             AddJSONProperty(Props, 'symbol', Obj.LibReference);
                             AddJSONProperty(Props, 'comment', Obj.Comment.Text);
                             AddJSONProperty(Props, 'description', Obj.ComponentDescription);
+                            AddJSONProperty(Props, 'design_item_id', Obj.DesignItemID);
                             AddJSONInteger(Props, 'orientation', Obj.Orientation);
                             AddJSONBoolean(Props, 'mirror', Obj.IsMirrored);
                             Values := TStringList.Create;
@@ -161,8 +162,8 @@ begin
                                             try
                                                 AddJSONProperty(PinProps, 'designator', Child.Designator);
                                                 AddJSONProperty(PinProps, 'name', Child.Name);
-                                                AddJSONInteger(PinProps, 'x', X);
-                                                AddJSONInteger(PinProps, 'y', Y);
+                                                AddJSONNumber(PinProps, 'x', CoordToMils(X));
+                                                AddJSONNumber(PinProps, 'y', CoordToMils(Y));
                                                 Pins.Add(BuildJSONObject(PinProps));
                                             finally
                                                 PinProps.Free;
@@ -236,6 +237,7 @@ begin
         if EditHas(Spec, Prefix + 'designator') then Obj.Designator.Text := EditValue(Spec, Prefix + 'designator');
         if EditHas(Spec, Prefix + 'comment') then Obj.Comment.Text := EditValue(Spec, Prefix + 'comment');
         if EditHas(Spec, Prefix + 'description') then Obj.ComponentDescription := EditValue(Spec, Prefix + 'description');
+        if EditHas(Spec, Prefix + 'design_item_id') then Obj.DesignItemID := EditValue(Spec, Prefix + 'design_item_id');
         if EditHas(Spec, Prefix + 'parameter_count') then
             for V := 0 to StrToInt(EditValue(Spec, Prefix + 'parameter_count')) - 1 do
             begin
@@ -312,14 +314,14 @@ begin
         LogScriptError('edit_schematic: read spec');
         Spec.LoadFromFile(SpecPath);
         Path := EditValue(Spec, 'sheet_path');
-        if (not FileExists(Path)) or (LowerCase(ExtractFileExt(Path)) <> '.schdoc') then
+        if LowerCase(ExtractFileExt(Path)) <> '.schdoc' then
         begin
-            Result := 'ERROR: target must be an existing .SchDoc';
+            Result := 'ERROR: target must be a SchDoc';
             Exit;
         end;
         LogScriptError('edit_schematic: open exact target ' + Path);
-        ClientDoc := Client.GetDocumentByPath(Path);
-        if ClientDoc = nil then ClientDoc := Client.OpenDocument('SCH', Path);
+        ClientDoc := FindOpenDocument(Path);
+        if (ClientDoc = nil) and FileExists(Path) then ClientDoc := Client.OpenDocument('SCH', Path);
         if ClientDoc = nil then
         begin
             Result := 'ERROR: could not open target schematic';
@@ -336,6 +338,11 @@ begin
         if Doc.ObjectId <> 32 then
         begin
             Result := 'ERROR: refusing to edit a library or other document kind';
+            Exit;
+        end;
+        if NormalizedPath(Doc.DocumentName) <> NormalizedPath(Path) then
+        begin
+            Result := 'ERROR: focused schematic identity mismatch';
             Exit;
         end;
         WasModified := ClientDoc.Modified;
@@ -495,6 +502,7 @@ begin
         try
             AddJSONBoolean(Props, 'success', ErrorText = '');
             AddJSONProperty(Props, 'sheet_path', Path);
+            AddJSONProperty(Props, 'coordinate_units', 'mils');
             AddJSONBoolean(Props, 'saved', False);
             AddJSONBoolean(Props, 'was_modified', WasModified);
             AddJSONInteger(Props, 'applied_count', Applied);

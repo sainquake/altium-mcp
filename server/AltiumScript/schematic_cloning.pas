@@ -140,8 +140,8 @@ begin
                             AddJSONInteger(Item, 'electrical', Obj.Electrical);
                             AddJSONNumber(Item, 'length', CoordToMils(Obj.PinLength));
                             GetPinHotEnd(Obj, X, Y);
-                            AddJSONInteger(Item, 'hot_x', X);
-                            AddJSONInteger(Item, 'hot_y', Y);
+                            AddJSONNumber(Item, 'hot_x', CoordToMils(X));
+                            AddJSONNumber(Item, 'hot_y', CoordToMils(Y));
                             Pins.Add(BuildJSONObject(Item));
                         end
                         else

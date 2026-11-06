@@ -35,13 +35,14 @@ import routing
 import sandbox
 import win_processes
 from outjob_parser import parse_outjob
-from schematic_editor import validate_request as validate_schematic_edit
+from schematic_editor import validate_request as validate_schematic_edit, compact_result as compact_schematic_result
 import schematic_connectivity
 import library_component_data
 import symbol_metadata
 import document_management
 import document_closing
 import schematic_cloning
+import schematic_document
 import footprint_editor
 import project_selection
 import lcsc_catalog
@@ -167,6 +168,7 @@ MUTATING_COMMANDS = {
     "set_library_component_data", "create_document", "open_document", "save_document",
     "add_document_to_project", "open_project", "select_project", "close_document", "clone_schematic_components",
     "set_footprint_pad_settings", "edit_footprint_primitives",
+    "set_schematic_sheet_properties", "save_project",
 }
 
 # Present while a script the MCP launched is stuck (paused in Altium's
@@ -2328,9 +2330,55 @@ async def build_schematic(ctx: Context, parts: list, wires: list = None,
     return json.dumps(result, indent=2)
 
 @_tool()
+async def set_schematic_sheet_properties(ctx: Context, sheet_path: str, sheet_size: Optional[str] = None) -> str:
+    """Read/change ISO format of an exact saved or open named unsaved SchDoc.
+
+    sheet_size: A0..A4. Omit to read. Changes only SheetStyle, marks changes
+    Modified, verifies the size and never saves or changes project membership.
+    """
+    try:
+        spec = schematic_document.prepare_sheet(sheet_path, sheet_size)
+        return await schematic_document.execute(altium_bridge, EXCHANGE_DIR, "set_schematic_sheet_properties", spec)
+    except (ValueError, TypeError, OSError) as exc:
+        return json.dumps({"success": False, "error": str(exc), "saved": False, "may_have_partial_changes": False})
+
+
+@_tool(read_only=True)
+async def zoom_schematic(ctx: Context, sheet_path: str, mode: str = "all") -> str:
+    """Focus an exact SchDoc and fit objects or the page using native SCH:Zoom.
+
+    mode='all' fits objects; 'sheet' fits the page. Works with named unsaved sheets. Preserves
+    Modified and never saves or edits objects. Use get_screenshot(view_type='sch')
+    afterwards for native PNG pixels instead of reconstructed drawing previews.
+    """
+    try:
+        spec = schematic_document.prepare_sheet(sheet_path, mode=mode)
+        return await schematic_document.execute(altium_bridge, EXCHANGE_DIR, "zoom_schematic", spec)
+    except (ValueError, TypeError, OSError) as exc:
+        return json.dumps({"success": False, "error": str(exc), "saved": False, "may_have_partial_changes": False})
+
+
+@_tool()
+async def save_project(ctx: Context, project_path: str, dry_run: bool = False) -> str:
+    """Save only one exact OPEN local PrjPcb/LibPkg; never save source documents.
+
+    Saving must be authorized. All sources must exist on disk and be clean.
+    Uses FocusedProject SaveObject after exact focus verification, restores prior
+    project focus, checks source states/files and verifies disk membership.
+    dry_run=True preflights without saving or changing focus/membership; it does
+    not establish that Altium will accept a later real save. No Save All.
+    """
+    try:
+        spec = schematic_document.prepare_project(project_path, dry_run)
+        return await schematic_document.execute(altium_bridge, EXCHANGE_DIR, "save_project", spec)
+    except (ValueError, TypeError, OSError) as exc:
+        return json.dumps({"success": False, "error": str(exc), "saved": False, "project_saved": False, "may_have_partial_changes": False})
+
+
+@_tool()
 async def edit_schematic(ctx: Context, sheet_path: str, operations: list,
-                         unit: str = "mil", save: bool = False) -> str:
-    """Add, update or delete objects on an exact existing .SchDoc, in memory.
+                         unit: str = "mil", save: bool = False, return_mode: str = "full") -> str:
+    """Add, update or delete objects on an exact saved or open named unsaved SchDoc.
 
     Never saves documents. operations=[] reads the sheet's objects and UIDs.
     Each operation: {"op":"add|update|delete", "type":"component|wire|net_label|
@@ -2339,7 +2387,8 @@ async def edit_schematic(ctx: Context, sheet_path: str, operations: list,
     Omit target for add and properties for delete. One edit per target per batch.
 
     Properties (all coordinates in mils): component: x,y,orientation(0..3),
-    mirror(bool),designator,comment,description,parameters({name:string}). Add a
+    mirror(bool),designator,comment,description,design_item_id,parameters({name:string}).
+    Set design_item_id="" to detach a copied prototype's DesignItemID. Add a
     component with source_designator (clone on this sheet), OR symbol_library
     (existing .SchLib) and symbol. Symbol sources are add-only. wire: points
     ([x1,y1,x2,y2,...], full replacement). net_label/text: x,y,text,orientation.
@@ -2379,11 +2428,19 @@ async def edit_schematic(ctx: Context, sheet_path: str, operations: list,
     part selects a multi-part component's part (1=A). Give x and y together.
     Action operations run in order in one undo group; inspect errors for
     partial failures. Moving components does not reroute their wires.
+
+    UID operations accept return_mode=full (default), changed (only changed
+    surviving objects) or summary (counts/results without object snapshots).
+    Coordinates, including pin connection points, are always in mils.
     """
+    if return_mode not in ("full", "changed", "summary"):
+        return json.dumps({"success": False, "error": "return_mode must be full, changed or summary", "saved": False, "applied_count": 0})
     if isinstance(operations, list) and any(
         isinstance(op, dict) and isinstance(op.get("op"), str)
         and op["op"] not in {"add", "update", "delete"} for op in operations
     ):
+        if return_mode != "full":
+            return json.dumps({"success": False, "error": "compact return modes require UID add/update/delete operations", "saved": False, "applied_count": 0})
         return await _edit_schematic_actions(ctx, sheet_path, operations, unit, save)
     if unit != "mil" or save is not False:
         return json.dumps({"success": False, "saved": False, "applied_count": 0,
@@ -2403,6 +2460,8 @@ async def edit_schematic(ctx: Context, sheet_path: str, operations: list,
                                "saved": False, "may_have_partial_changes": bool(operations),
                                "spec_file": str(spec_path)})
         result = response.get("result", {})
+        if return_mode != "full":
+            result = compact_schematic_result(json.loads(result) if isinstance(result, str) else result, return_mode)
         return result if isinstance(result, str) else json.dumps(result, indent=2, ensure_ascii=False)
     finally:
         # Keep a timed-out request's spec: a late-starting script still needs it.

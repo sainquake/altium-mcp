@@ -191,6 +191,10 @@ AnnotationEnabled=1
 DocumentPath=footprint_editor.pas
 AnnotationEnabled=1
 
+[Document14]
+DocumentPath=schematic_document.pas
+AnnotationEnabled=1
+
 [OutputGroup1]
 Name=Netlist Outputs
 Description=
