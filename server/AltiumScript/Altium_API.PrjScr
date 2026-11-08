@@ -1190,3 +1190,9 @@ DocumentPath=symbol_primitives.pas
 
 [Document17]
 DocumentPath=empty_library_component.pas
+
+[Document18]
+DocumentPath=library_view.pas
+
+[Document19]
+DocumentPath=library_components_data.pas

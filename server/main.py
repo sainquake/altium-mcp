@@ -47,6 +47,9 @@ import library_component_properties
 import schematic_diagram
 import symbol_primitives
 import empty_library_component
+import library_view
+import library_components_data
+import library_validation
 import footprint_editor
 import project_selection
 import lcsc_catalog
@@ -169,7 +172,7 @@ MUTATING_COMMANDS = {
     "move_components", "place_components", "create_symbols_batch", "build_circuit",
     "create_footprints_batch", "layout_duplicator", "layout_duplicator_apply",
     "run_output_jobs", "create_pcb_footprint", "edit_schematic", "edit_schematic_actions",
-    "set_library_component_data", "update_symbol_primitives", "remove_empty_library_component", "create_document", "open_document", "save_document",
+    "set_library_component_data", "update_symbol_primitives", "remove_empty_library_component", "set_library_view", "create_document", "open_document", "save_document",
     "add_document_to_project", "open_project", "select_project", "close_document", "clone_schematic_components",
     "set_footprint_pad_settings", "edit_footprint_primitives", "set_footprint_properties", "set_footprint_pad_properties",
     "set_schematic_sheet_properties", "save_project", "edit_sheet_symbols", "draw_block_diagram",
@@ -2671,6 +2674,109 @@ async def set_library_component_lcsc_data(ctx: Context, library_path: str, symbo
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 
+@_tool(read_only=True)
+async def validate_library_components(ctx: Context, library_paths: str | list[str],
+                                       component_names: Optional[list[str]] = None,
+                                       rules: Optional[dict] = None, pad_roles: Optional[list[dict]] = None,
+                                       offset: int = 0, limit: int = 50, max_issues: int = 500) -> str:
+    """Validate SchLib/PcbLib buffers without edits, compilation or saves.
+
+    Paths/names/pages follow get_library_components_data. Checks required symbol
+    parameters, native Description/Designator, pin grid/duplicates, every PCB
+    pin map (including implicit same-name maps), and footprint pad dimensions,
+    annular rings, copper/NPTH gaps, solder-mask webs and paste apertures/gaps.
+    Resolves models only inside explicit input PcbLibs, honoring stored links;
+    linked footprints are checked even outside the root page/name filter.
+
+    rules overrides documented defaults: required_parameters; pin_grid_mils,
+    grid_tolerance_mils; min/max_pad_size_mm; min_copper_clearance_mm,
+    min_npth_clearance_mm, min_annular_ring_mm, min_mask_web_mm,
+    min_paste_clearance_mm, max_paste_expansion_mm; optional
+    rule_mask_expansion_mm/rule_paste_expansion_mm; require_footprint and
+    require_shield_mapping. Rule-driven mask/paste values remain unresolved
+    unless supplied. These are configurable checks, not a fabrication standard.
+    pad_roles:[{library_path,footprint_name,pad_name,role:'electrical|shield|npth',
+    paste_required?:bool}]. Native testpoints allow intentional paste suppression.
+    NPTH uses native hole/plating; unconfirmed shield name hints are explicit.
+
+    Geometry covers concentric legacy standard pad stacks, not custom/offset
+    contours or non-pad copper. Rotated rectangles/circles and standard holes
+    are supported; conservative bounds never certify a suspected violation.
+    Reports stable issue codes, severity/measurements, roles, dependencies and
+    coverage. success means execution, valid is false on errors, null when
+    incomplete, true only for fully checked selection. max_issues caps output,
+    not analysis/counts. Dirty buffers, selections, views and disk are preserved.
+    See dev/LIBRARY_VALIDATION.md for defaults, scope and examples.
+    """
+    return await library_validation.execute(altium_bridge, EXCHANGE_DIR, library_paths, component_names,
+                                            rules, pad_roles, offset, limit, max_issues)
+
+
+@_tool(read_only=True)
+async def get_library_components_data(ctx: Context, library_paths: str | list[str],
+                                      component_names: Optional[list[str]] = None,
+                                      fields: Optional[list[str]] = None, offset: int = 0, limit: int = 50) -> str:
+    """Batch-read exact saved/open named unsaved SchLib/PcbLib buffers in one run.
+
+    library_paths: one absolute path or 1..16 distinct paths. component_names:
+    omitted for all, otherwise 1..500 distinct exact case-insensitive native
+    symbol/footprint names (not Component ID parameters or substring searches).
+    Reads dirty buffers without reload, never changes the active member/part/
+    display mode and restores the previous document view. Newly opened libraries
+    remain open; never compiles, edits objects or saves documents.
+
+    fields defaults to ['properties','parameters','models']; optional sections
+    'pins','pads' request detailed arrays. Pass all five names for full data.
+    SchLib properties: Designator template, ComponentKind/name/code, Comment,
+    description, part/display counts and current part/mode. parameters is the
+    native name/value dictionary; models includes footprint/datafile bindings,
+    raw maps and parsed pin_map (one-to-many). pins covers all parts/modes with
+    numbers, names, native x/y/length in mils, ownership, electrical/visibility,
+    UIDs, descriptions, IEEE symbols and pin parameters.
+    PcbLib properties: native Height in mm and description; pads: every physical
+    pad name/layer and native Testpoint Top/Bottom booleans. No fabricated PcbLib
+    symbol parameters/ComponentKind; unsupported sections are listed per library.
+    This is library metadata, not placed/compiled connectivity or a file-link audit.
+
+    offset/limit paginate matching members across input library order, each
+    library sorted by native case-insensitive name; limit 1..500, default 50.
+    Missing names are explicit, with complete=False; row/library errors preserve
+    other results and set success=False. has_more/next_offset describe pagination.
+    Partial page errors occupy a page slot. Read-only annotations, disk hash/
+    timestamp checks, Modified/selection/view verification; no ad-hoc scripts.
+    """
+    return await library_components_data.execute(altium_bridge, EXCHANGE_DIR, library_paths,
+                                                  component_names, fields, offset, limit)
+
+
+@_tool()
+async def set_library_view(ctx: Context, library_path: str, component_name: Optional[str] = None,
+                           part_id: Optional[int] = None, display_mode: Optional[int] = None,
+                           fit: bool = True, view_mode: Optional[str] = None, camera: Optional[str] = None) -> str:
+    """Navigate an exact saved/open named unsaved SchLib or PcbLib without saving.
+
+    component_name matches one exact symbol/footprint, case-insensitively; omitted
+    uses its current member. SchLib: part_id is 1-based, display_mode is 0-based;
+    both are checked against the symbol counts and read back from the editor.
+    PcbLib: view_mode='2d'|'3d'; camera='top'|'bottom'|'front'|'back'|'left'|'right'|
+    'isometric'|'flipped_isometric'. Camera implies 3d; rejects 2d plus camera.
+    SchLib rejects 3d/camera; PcbLib rejects part/display selectors.
+    fit=True fits objects; explicit 3d/camera uses padded physical bounds, then
+    applies camera last (library Zoom All resets its pose). Text-only/empty 3d
+    footprints need fit=False. Omitted mode/camera send no such commands; native
+    fitting can reset orientation. fit=False with no selectors reads
+    the current member/part/display; a missing or ambiguous member is refused.
+
+    Verifies exact native selection, unchanged exposed content/metadata, Modified
+    and disk hash/timestamp. Fit, 2D/3D and camera are fixed native commands;
+    the API has no supported camera/mode readback, so their verification is
+    explicitly dispatch_only. Does not edit primitives, create members, compile,
+    save documents or automate mouse/keyboard input.
+    """
+    return await library_view.execute(altium_bridge, EXCHANGE_DIR, library_path, component_name,
+                                      part_id, display_mode, fit, view_mode, camera)
+
+
 @_tool()
 async def remove_empty_library_component(ctx: Context, library_path: str, component_name: str,
                                          dry_run: bool = False) -> str:
@@ -4964,6 +5070,16 @@ def _bring_to_front(hwnd):
             win32process.AttachThreadInput(this_thread, front_thread, False)
 
 
+def _grab_stable_window_image(hwnd, width, height, is_foreground):
+    """Refuse compositor captures if another app takes focus during rendering."""
+    if not is_foreground():
+        raise RuntimeError("Altium lost foreground before capture")
+    image = _grab_window_image(hwnd, width, height)
+    if not is_foreground():
+        raise RuntimeError("Altium lost foreground during capture")
+    return image
+
+
 def _grab_window_image(hwnd, width: int, height: int) -> Image.Image:
     """Copy the foreground window from the composed desktop into an RGB image.
 
@@ -5180,7 +5296,7 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
                 # Take screenshot using GDI functions instead of ImageGrab
                 try:
                     try:
-                        img = _grab_window_image(hwnd, width, height)
+                        img = _grab_stable_window_image(hwnd, width, height, altium_is_foreground)
                     finally:
                         # Not when the user has already moved on by themselves
                         if previous_pid not in (0, altium_pid) and altium_is_foreground():

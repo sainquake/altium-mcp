@@ -7,6 +7,23 @@ from unittest.mock import Mock
 
 
 class ScreenshotCaptureTest(unittest.TestCase):
+    def stable_capture(self):
+        tree = ast.parse((Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8"))
+        function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_grab_stable_window_image")
+        grab = Mock(return_value="image")
+        scope = {"_grab_window_image": grab}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), "capture", "exec"), scope)
+        return scope["_grab_stable_window_image"], grab
+
+    def test_foreground_loss_refuses_wrong_app_images(self):
+        capture, grab = self.stable_capture()
+        with self.assertRaisesRegex(RuntimeError, "before capture"):
+            capture(10, 100, 100, Mock(return_value=False))
+        grab.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, "during capture"):
+            capture(10, 100, 100, Mock(side_effect=[True, False]))
+        self.assertEqual(capture(10, 100, 100, Mock(return_value=True)), "image")
+
     def load(self):
         tree = ast.parse((Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8"))
         function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_grab_window_image")
