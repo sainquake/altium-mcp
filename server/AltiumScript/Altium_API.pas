@@ -1283,10 +1283,11 @@ begin
         end;
     end
     else if (CommandName <> 'edit_schematic') and (CommandName <> 'get_schematic_connectivity') and
-       (CommandName <> 'set_library_component_data') and (CommandName <> 'clone_schematic_components') and
+       (CommandName <> 'set_library_component_data') and (CommandName <> 'update_symbol_primitives') and (CommandName <> 'clone_schematic_components') and
        (CommandName <> 'set_footprint_pad_settings') and (CommandName <> 'edit_footprint_primitives') and
-       (CommandName <> 'get_pcb_api_constants') and
+       (CommandName <> 'get_pcb_api_constants') and (CommandName <> 'set_footprint_properties') and (CommandName <> 'set_footprint_pad_properties') and
        (CommandName <> 'set_schematic_sheet_properties') and (CommandName <> 'zoom_schematic') and
+       (CommandName <> 'edit_sheet_symbols') and (CommandName <> 'draw_block_diagram') and
        (CommandName <> 'save_project') and
        (CommandName <> 'create_document') and (CommandName <> 'save_document') and
        (CommandName <> 'open_document') and (CommandName <> 'open_project') and (CommandName <> 'close_document') and
@@ -1364,16 +1365,20 @@ begin
             Result := ExecuteSchematicConnectivity(RequestData);
         'set_library_component_data':
             Result := ExecuteLibraryComponentData(RequestData);
+        'update_symbol_primitives':
+            Result := ExecuteUpdateSymbolPrimitives(RequestData);
         'create_document', 'open_document', 'save_document', 'add_document_to_project':
             Result := ExecuteManageDocument(CommandName, RequestData);
         'close_document':
             Result := ExecuteCloseDocument(RequestData);
         'clone_schematic_components':
             Result := ExecuteCloneSchematicComponents(RequestData);
-        'set_footprint_pad_settings', 'edit_footprint_primitives', 'get_pcb_api_constants':
+        'set_footprint_pad_settings', 'edit_footprint_primitives', 'get_pcb_api_constants', 'set_footprint_properties', 'set_footprint_pad_properties':
             Result := ExecuteFootprintLibraryCommand(CommandName, RequestData);
         'set_schematic_sheet_properties', 'zoom_schematic', 'save_project':
             Result := ExecuteSchematicDocumentCommand(CommandName, RequestData);
+        'edit_sheet_symbols', 'draw_block_diagram':
+            Result := ExecuteSchematicDiagram(CommandName, RequestData);
         'open_project':
             Result := ExecuteOpenProject(RequestData);
         'select_project':
@@ -1637,10 +1642,11 @@ begin
                 // which can show another project's document before validation.
                 if (CommandType <> 'select_project') and (CommandType <> 'open_project') and
                    (CommandType <> 'open_document') and (CommandType <> 'close_document') and
-                   (CommandType <> 'clone_schematic_components') and
+                   (CommandType <> 'clone_schematic_components') and (CommandType <> 'update_symbol_primitives') and
                    (CommandType <> 'set_footprint_pad_settings') and (CommandType <> 'edit_footprint_primitives') and
-                   (CommandType <> 'get_pcb_api_constants') and
+                   (CommandType <> 'get_pcb_api_constants') and (CommandType <> 'set_footprint_properties') and (CommandType <> 'set_footprint_pad_properties') and
                    (CommandType <> 'set_schematic_sheet_properties') and (CommandType <> 'zoom_schematic') and
+                   (CommandType <> 'edit_sheet_symbols') and (CommandType <> 'draw_block_diagram') and
                    (CommandType <> 'save_project') then EnsureDesignProjectFocused();
                 Result := ExecuteCommand(CommandType);
                 // Remember an explicitly selected project for later recovery.

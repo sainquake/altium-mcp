@@ -514,6 +514,7 @@ begin
 
                     AddJSONProperty(FPProps, 'name', LibComp.Name);
                     AddJSONProperty(FPProps, 'description', LibComp.Description);
+                    AddJSONNumber(FPProps, 'height_mm', FootprintHeightMM(LibComp));
                     for i := 0 to Counts.Count - 1 do
                         AddJSONInteger(FPProps, Counts.Names[i], StrToInt(Counts.ValueFromIndex[i]));
                     FPArray.Add(BuildJSONObject(FPProps, 1));
@@ -532,6 +533,7 @@ begin
                 try
                     AddJSONProperty(FPProps, 'footprint_name', LibComp.Name);
                     AddJSONProperty(FPProps, 'description', LibComp.Description);
+                    AddJSONNumber(FPProps, 'height_mm', FootprintHeightMM(LibComp));
 
                     // The footprint shown in the editor is held in library
                     // coordinates, offset by the library origin; report every
@@ -593,6 +595,8 @@ begin
                                         AddJSONBoolean(PrimProps, 'cache_readable', False);
                                     end;
                                     AddJSONBoolean(PrimProps, 'locked', not Prim.Moveable);
+                                    AddJSONBoolean(PrimProps, 'is_testpoint_top', Prim.IsTestpoint_Top);
+                                    AddJSONBoolean(PrimProps, 'is_testpoint_bottom', Prim.IsTestpoint_Bottom);
                                 end;
                                 eTrackObject:
                                 begin

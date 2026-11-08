@@ -43,6 +43,9 @@ import document_management
 import document_closing
 import schematic_cloning
 import schematic_document
+import library_component_properties
+import schematic_diagram
+import symbol_primitives
 import footprint_editor
 import project_selection
 import lcsc_catalog
@@ -165,10 +168,10 @@ MUTATING_COMMANDS = {
     "move_components", "place_components", "create_symbols_batch", "build_circuit",
     "create_footprints_batch", "layout_duplicator", "layout_duplicator_apply",
     "run_output_jobs", "create_pcb_footprint", "edit_schematic", "edit_schematic_actions",
-    "set_library_component_data", "create_document", "open_document", "save_document",
+    "set_library_component_data", "update_symbol_primitives", "create_document", "open_document", "save_document",
     "add_document_to_project", "open_project", "select_project", "close_document", "clone_schematic_components",
-    "set_footprint_pad_settings", "edit_footprint_primitives",
-    "set_schematic_sheet_properties", "save_project",
+    "set_footprint_pad_settings", "edit_footprint_primitives", "set_footprint_properties", "set_footprint_pad_properties",
+    "set_schematic_sheet_properties", "save_project", "edit_sheet_symbols", "draw_block_diagram",
 }
 
 # Present while a script the MCP launched is stuck (paused in Altium's
@@ -2005,6 +2008,11 @@ async def get_footprint_primitives(ctx: Context, library_path: str = "", footpri
     """
     Read the primitives of footprints in a PCB library (.PcbLib).
 
+    Both modes report the native footprint Height as height_mm, separately from
+    3D body heights. Use set_footprint_properties to change this stored property.
+    Pad dumps report native is_testpoint_top/is_testpoint_bottom flags; change
+    them with set_footprint_pad_properties.
+
     Modes:
     - footprint_name omitted: inventory of every footprint with per-type
       primitive counts (pads, tracks, arcs, fills, texts, regions, vias,
@@ -2063,6 +2071,48 @@ async def get_footprint_primitives(ctx: Context, library_path: str = "", footpri
     if isinstance(result, dict):
         pcblib_file.add_body_placements(result)
     return json.dumps(result, indent=2)
+
+@_tool()
+async def set_footprint_properties(ctx: Context, library_path: str, footprint_name: str,
+                                   height_mm: Optional[float] = None) -> str:
+    """Read/set native Height of one existing footprint in an exact .PcbLib; never save.
+
+    library_path is an absolute existing .PcbLib path. Reuses open unsaved edits;
+    footprint_name matches exactly once, case-insensitively. height_mm is a finite
+    number from 0 to 1000 mm; zero clears the stored height. Omit it to read.
+    Changes IPCB_LibComponent.Height, preserving primitives, pads and 3D bodies.
+    This stored property does not resize 3D geometry; Altium height rules may
+    prioritize existing 3D bodies. Does not update placed PCB parts or save files.
+    One undo group; identical requests preserve Modified. Returns before/after
+    height_mm, changed and native readback/disk verification. On errors inspect
+    may_have_partial_changes/outcome_unknown before retrying.
+    """
+    return await footprint_editor.execute(altium_bridge, EXCHANGE_DIR, "set_footprint_properties",
+                                          footprint_editor.prepare_properties, library_path, footprint_name, height_mm)
+
+
+@_tool()
+async def set_footprint_pad_properties(ctx: Context, library_path: str, footprint_name: str, pad_names: list[str],
+                                       is_testpoint_top: Optional[bool] = None,
+                                       is_testpoint_bottom: Optional[bool] = None) -> str:
+    """Read/set native Testpoint Top/Bottom flags on exact existing PcbLib pads; never save.
+
+    Absolute existing library_path; reuses open dirty buffers without reloading.
+    footprint_name and each of 1..1000 distinct pad_names must match exactly once,
+    case-insensitively. All targets are preflighted before any change. True enables,
+    False clears; omitted sides are preserved. Omit both to read selected pads.
+    Writes native IsTestpoint_Top/IsTestpoint_Bottom; no text parameters are created.
+    Enabling Top requires Top Layer/Multi-Layer copper; Bottom requires Bottom
+    Layer/Multi-Layer. An incompatible side rejects the whole batch before edits.
+    Preserves geometry, layers, locks, mask/paste settings and unselected pads.
+    One undo group, idempotent no-ops, Modified/readback and disk verification.
+    Does not update placed components, run testpoint assignment or save files.
+    Inspect may_have_partial_changes/outcome_unknown before retrying errors.
+    """
+    return await footprint_editor.execute(altium_bridge, EXCHANGE_DIR, "set_footprint_pad_properties",
+                                          footprint_editor.prepare_pad_properties, library_path, footprint_name,
+                                          pad_names, is_testpoint_top, is_testpoint_bottom)
+
 
 @_tool()
 async def set_footprint_pad_settings(ctx: Context, library_path: str, footprint_name: str,
@@ -2376,6 +2426,63 @@ async def save_project(ctx: Context, project_path: str, dry_run: bool = False) -
 
 
 @_tool()
+async def edit_sheet_symbols(ctx: Context, sheet_path: str, operations: list) -> str:
+    """Read/create/update/delete native Sheet Symbols and their Sheet Entries; never save.
+
+    Exact saved or open named unsaved SchDoc, coordinates in mils. operations=[]
+    reads symbols/entries with UIDs, ownership and coordinates. Operations:
+    {op:'add', properties:{designator,filename,x,y,width,height,entries:[]}},
+    {op:'update', unique_id, properties:{...}}, {op:'delete', unique_id}.
+    x/y is the symbol's lower-left corner. filename references one child SchDoc;
+    it is not created/opened or added to a project. Entries: {name,side,offset,
+    io_type?}; side=left/right/top/bottom, io_type=unspecified/input/output/
+    bidirectional. Offset is mils from top on vertical sides, from left on
+    horizontal sides, strictly inside the edge. Names and positions are distinct.
+    Omit entries on update to preserve them; supply the COMPLETE desired list
+    to replace entries (new entry UIDs), [] clears them. Symbol UID is preserved.
+    Only one operation per existing symbol per batch. Targets, names and resulting
+    entry bounds are checked before editing. One undo group. Returns native
+    readback/verification; inspect may_have_partial_changes before retrying errors.
+    Does not compile or create child Ports/wires. Use edit_schematic for those.
+    """
+    try:
+        spec = schematic_diagram.prepare_symbols(sheet_path, operations)
+        result = await schematic_diagram.execute(altium_bridge, EXCHANGE_DIR, "edit_sheet_symbols", spec)
+        return json.dumps(result, indent=2, ensure_ascii=False)
+    except (ValueError, TypeError, OSError) as exc:
+        return json.dumps({"success": False, "error": str(exc), "saved": False, "may_have_partial_changes": False})
+
+
+@_tool()
+async def draw_block_diagram(ctx: Context, sheet_path: str, blocks: list, links: list, notes: list) -> str:
+    """Add a non-electrical block diagram to an exact SchDoc, in memory only.
+
+    Coordinates in mils, y increases upward. blocks:[{id,text,x,y,width,height}],
+    x/y=lower-left. links:[{from,to,text?,from_side?,to_side?,points?,arrow?}],
+    sides left/right/top/bottom. Defaults choose facing sides and orthogonal
+    center routes; arrow defaults True. Optional points:[[x,y],...] is the FULL
+    orthogonal route including both side-center anchors. Crossing block interiors
+    is rejected; supply points for detours. notes:[{x,y,text}]. Lists may be empty.
+    Creates native rectangles, labels and polylines, including graphical arrowheads.
+    Creates NO electrical wires, nets, ports or sheet hierarchy. Use edit_sheet_symbols
+    for hierarchy. Does not save, compile or add project members. Validates the full
+    request first; one undo group. Returns roles/UIDs, routes and native readback.
+    Calling again appends objects; it does not replace a previous diagram.
+    API errors can leave partial changes: inspect outcome before retrying.
+    """
+    try:
+        spec, routes = schematic_diagram.prepare_diagram(sheet_path, blocks, links, notes)
+        result = await schematic_diagram.execute(altium_bridge, EXCHANGE_DIR, "draw_block_diagram", spec)
+        result["routes"] = routes
+        if spec["count"] and isinstance(result.get("objects"), list):
+            changed = {row["unique_id"] for row in result.get("results", [])}
+            result["objects"] = [obj for obj in result["objects"] if obj.get("unique_id") in changed]
+        return json.dumps(result, indent=2, ensure_ascii=False)
+    except (ValueError, TypeError, OSError) as exc:
+        return json.dumps({"success": False, "error": str(exc), "saved": False, "may_have_partial_changes": False})
+
+
+@_tool()
 async def edit_schematic(ctx: Context, sheet_path: str, operations: list,
                          unit: str = "mil", save: bool = False, return_mode: str = "full") -> str:
     """Add, update or delete objects on an exact saved or open named unsaved SchDoc.
@@ -2564,13 +2671,66 @@ async def set_library_component_lcsc_data(ctx: Context, library_path: str, symbo
 
 
 @_tool()
+async def update_symbol_primitives(ctx: Context, library_path: str, symbol_name: str, edits: list) -> str:
+    """Update existing SchLib labels, drawing objects and pins in place; never save.
+
+    Exact absolute existing .SchLib; reuses dirty buffers. edits=[] reads current
+    objects, UIDs, owner_part_id/display_mode and properties. Each edit:
+    {target:{type:'label',owner_part_id:1,text:'RED'},properties:{text:'Red'}}.
+    Targets match exactly once by unique_id and/or current property values within
+    this symbol; add part/display selectors for multipart symbols. One edit per
+    object per batch. All targets are resolved before mutation; no add/delete.
+
+    Types/properties (mils, y up): label: text,x,y,orientation(0..3),justification
+    (0..8),color,font_name,font_size,font_bold/font_italic/font_underline/font_strikeout.
+    line/rectangle: x1,y1,x2,y2,line_width(0..3),color; rectangle adds is_solid,
+    area_color. polyline/polygon: vertices:[{x,y},...],line_width,color; polygon adds
+    is_solid,area_color. arc: cx,cy,radius,start_angle,end_angle,line_width,color.
+    ellipse: cx,cy,radius,secondary_radius,line_width,color,is_solid,area_color.
+    pin: pin_name,description,x,y,length,orientation,electrical(0..7),show_name,
+    show_designator,is_hidden,color. Colors are native BGR integers. Supply coordinate
+    pairs together. Pin numbers, object UID and part/display ownership are read-only
+    (pin_number can select pins); use set_library_component_data for model maps.
+
+    Preserves symbol/object identity, unrequested properties, parameters and models.
+    One undo group, idempotent no-ops and native readback/disk verification.
+    Does not recreate symbols, update placed parts, compile or save documents.
+    Inspect may_have_partial_changes/outcome_unknown before retrying failures.
+    """
+    return await symbol_primitives.execute(altium_bridge, EXCHANGE_DIR, library_path, symbol_name, edits)
+
+
+@_tool()
+async def set_library_component_properties(ctx: Context, library_path: str, symbol_name: str,
+                                           designator_template: Optional[str] = None,
+                                           component_kind: Optional[str] = None) -> str:
+    """Set native default Designator and Component Type on one existing SchLib symbol.
+
+    Exact absolute saved .SchLib path; reuses open unsaved changes without reload.
+    designator_template: J?, D?, C?, etc.; prefix starts with a letter and contains
+    letters/digits/underscore, followed by one '?', at most 64 characters.
+    component_kind: standard, mechanical, graphical, net_tie_bom, net_tie_no_bom,
+    standard_no_bom. Case-insensitive UI labels also work, e.g. 'Standard (No BOM)',
+    'Net Tie (In BOM)' and 'Net Tie'. Native ComponentKind is changed; no custom
+    BOM parameter is created. Omit either field to preserve it; omit both to read.
+    Preserves parameters, models, geometry and other symbols. Does not renumber
+    placed components, update a project/PCB, compile or save any document.
+    One undo group, readback and disk verification; identical requests are no-ops.
+    On failure inspect may_have_partial_changes/outcome_unknown before retrying.
+    """
+    return await library_component_properties.execute(altium_bridge, EXCHANGE_DIR, library_path,
+                                                       symbol_name, designator_template, component_kind)
+
+
+@_tool()
 async def set_library_component_data(ctx: Context, library_path: str, symbol_name: str,
                                      parameters: Optional[dict] = None, footprint_models: Optional[list] = None,
                                      comment: Optional[str] = None, description: Optional[str] = None) -> str:
     """Upsert parameters and PCB footprint models on an exact existing SchLib symbol.
     Never saves documents or updates placed components. Omit edits to read metadata.
     parameters maps names to string values; Comment/Designator are reserved (use
-    comment separately). Existing parameter visibility and unrelated data remain.
+    comment separately; use set_library_component_properties for Designator/type).
+    Existing parameter visibility and unrelated data remain.
     footprint_models: [{"model_name":"R_0603","library_path":"C:/Lib/Parts.PcbLib",
     "pin_map":{"1":["2"],"2":["1"]},"is_current":true,"description":"optional"}].
     Each model requires an existing PcbLib/footprint and a complete pin_map across

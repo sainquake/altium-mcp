@@ -50,7 +50,8 @@ Existing parameter visibility and other attributes are retained. Unspecified
 parameters remain. There is no parameter deletion operation.
 
 `Comment` and `Designator` are reserved parameter names. Use the separate
-`comment` argument; changing the library designator is unsupported.
+`comment` argument. Use [set_library_component_properties](LIBRARY_COMPONENT_PROPERTIES.md)
+for the native Designator template and Component Type, including Standard (No BOM).
 `description` updates the symbol description. Empty strings are valid;
 `None` means leave unchanged. Read-only parameters/Comment are rejected.
 

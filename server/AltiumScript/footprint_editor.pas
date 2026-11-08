@@ -5,6 +5,9 @@ var
     N: Integer;
 begin
     Result := String2Layer(Name);
+    // Match the spelling returned by Layer2String for through-hole pads.
+    if SameText(Name, 'Multi-Layer') or SameText(Name, 'Multi Layer') or
+       SameText(Name, 'MultiLayer') or SameText(Name, 'eMultiLayer') then Result := eMultiLayer;
     // String2Layer does not consistently recognize mechanical layer names.
     for N := 1 to 16 do
         if SameText(Name, 'Mechanical ' + IntToStr(N)) then
@@ -127,6 +130,53 @@ begin
     else Result := False;
 end;
 
+function FootprintPadPropertiesSnapshot(Pad: IPCB_Pad): String;
+var Props: TStringList;
+begin
+    Props := TStringList.Create;
+    try
+        AddJSONProperty(Props, 'name', Pad.Name);
+        AddJSONBoolean(Props, 'is_testpoint_top', Pad.IsTestpoint_Top);
+        AddJSONBoolean(Props, 'is_testpoint_bottom', Pad.IsTestpoint_Bottom);
+        AddJSONBoolean(Props, 'locked', not Pad.Moveable);
+        AddJSONProperty(Props, 'layer', Layer2String(Pad.Layer));
+        Props.Add('"mask_settings":' + FootprintEditPadSnapshot(Pad));
+        Result := BuildJSONObject(Props);
+    finally Props.Free; end;
+end;
+
+function FootprintPadPropertiesChanged(Pad: IPCB_Pad; Spec: TStringList): Boolean;
+begin
+    Result := False;
+    if Spec.IndexOfName('is_testpoint_top') >= 0 then
+        Result := Pad.IsTestpoint_Top <> (Spec.Values['is_testpoint_top'] = '1');
+    if Spec.IndexOfName('is_testpoint_bottom') >= 0 then
+        Result := Result or (Pad.IsTestpoint_Bottom <> (Spec.Values['is_testpoint_bottom'] = '1'));
+end;
+
+function FootprintPadPropertiesPreflight(Pad: IPCB_Pad; Spec: TStringList): String;
+begin
+    Result := '';
+    if Spec.Values['is_testpoint_top'] = '1' then
+        if (Pad.Layer <> eTopLayer) and (Pad.Layer <> eMultiLayer) then
+            Result := 'Top testpoint requires a Top Layer or Multi-Layer pad: ' + Pad.Name;
+    if Spec.Values['is_testpoint_bottom'] = '1' then
+        if (Pad.Layer <> eBottomLayer) and (Pad.Layer <> eMultiLayer) then
+            Result := 'Bottom testpoint requires a Bottom Layer or Multi-Layer pad: ' + Pad.Name;
+end;
+
+function FootprintHeightMM(Comp: IPCB_LibComponent): Double;
+begin
+    // CoordToMils rounds to 0.001 mil; retain the native height precision.
+    Result := Comp.Height / MilsToCoord(1) * 0.0254;
+end;
+
+procedure FootprintPropertySnapshot(Items: TStringList; Comp: IPCB_LibComponent);
+begin
+    AddJSONNumber(Items, 'height_mm', FootprintHeightMM(Comp));
+    AddJSONProperty(Items, 'description', Comp.Description);
+end;
+
 function ExecuteFootprintLibraryCommand(Command: String; Request: TStringList): String;
 var
     Spec, Props, Addresses, BeforeItems, AfterItems, Constants: TStringList;
@@ -136,8 +186,9 @@ var
     Prim: IPCB_Primitive;
     Doc: IServerDocument;
     SpecPath, Path, Name, Prefix, ErrorText, Address, Item: String;
-    I, Count, Matches, OX, OY, Updated, Verified, Value: Integer;
-    Editing, IsPad: Boolean;
+    I, Count, Matches, OX, OY, Updated, Verified, Value, TargetHeight: Integer;
+    HeightMM: Double;
+    Editing, IsPad, IsPadProperties, WasModified, HaveProperties, NeedChanges, DoEdit: Boolean;
 begin
     Spec := TStringList.Create;
     Props := TStringList.Create;
@@ -150,6 +201,10 @@ begin
     Verified := 0;
     Editing := False;
     IsPad := False;
+    IsPadProperties := False;
+    NeedChanges := False;
+    WasModified := False;
+    HaveProperties := False;
     Path := '';
     Name := '';
     try
@@ -174,7 +229,8 @@ begin
                 Props.Add('"constants": ' + BuildJSONObject(Constants));
                 Break;
             end;
-            IsPad := Command = 'set_footprint_pad_settings';
+            IsPadProperties := Command = 'set_footprint_pad_properties';
+            IsPad := (Command = 'set_footprint_pad_settings') or IsPadProperties;
             Path := FootprintEditValue(Spec, 'library_path');
             Name := FootprintEditValue(Spec, 'footprint_name');
             if (Path = '') or not FileExists(Path) then begin ErrorText := 'Library file not found'; Break; end;
@@ -191,6 +247,38 @@ begin
                 begin Comp := PcbLib.GetComponent(I); Matches := Matches + 1; end;
             if Matches <> 1 then begin ErrorText := 'Footprint missing or ambiguous'; Break; end;
             PcbLib.CurrentComponent := Comp;
+            if IsPadProperties then
+            begin
+                HaveProperties := True;
+                WasModified := Doc.Modified;
+            end;
+            if Command = 'set_footprint_properties' then
+            begin
+                WasModified := Doc.Modified;
+                HaveProperties := True;
+                FootprintPropertySnapshot(BeforeItems, Comp);
+                TargetHeight := Comp.Height;
+                if Spec.IndexOfName('height_mm') >= 0 then
+                begin
+                    HeightMM := SafeStrToFloat(Spec.Values['height_mm']);
+                    if (HeightMM < 0) or (HeightMM > 1000) then
+                    begin ErrorText := 'Height must be from 0 to 1000 mm'; Break; end;
+                    TargetHeight := MilsToCoord(HeightMM / 0.0254);
+                end;
+                if TargetHeight <> Comp.Height then
+                begin
+                    PCBServer.PreProcess;
+                    Editing := True;
+                    PCBServer.SendMessageToRobots(Comp.I_ObjectAddress, c_Broadcast, PCBM_BeginModify, c_NoEventData);
+                    Updated := 1;
+                    try Comp.Height := TargetHeight;
+                    finally PCBServer.SendMessageToRobots(Comp.I_ObjectAddress, c_Broadcast, PCBM_EndModify, c_NoEventData); end;
+                end;
+                FootprintPropertySnapshot(AfterItems, Comp);
+                if Comp.Height = TargetHeight then Verified := 1
+                else ErrorText := 'Native footprint height readback failed';
+                Break;
+            end;
             OX := PcbLib.Board.XOrigin;
             OY := PcbLib.Board.YOrigin;
             // Resolve every selector before starting an undo group. Keep object
@@ -220,7 +308,14 @@ begin
                         begin
                             if Prim.ObjectId = ePadObject then
                                 if SameText(Prim.Name, FootprintEditValue(Spec, 'pad.' + IntToStr(I))) then
-                                begin Address := IntToStr(Prim.I_ObjectAddress); Matches := Matches + 1; end;
+                                begin
+                                    Address := IntToStr(Prim.I_ObjectAddress); Matches := Matches + 1;
+                                    if IsPadProperties then
+                                    begin
+                                        ErrorText := FootprintPadPropertiesPreflight(Prim, Spec);
+                                        NeedChanges := NeedChanges or FootprintPadPropertiesChanged(Prim, Spec);
+                                    end;
+                                end;
                         end
                         else if FootprintEditMatches(Prim, Spec, Prefix, OX, OY) then
                         begin Address := IntToStr(Prim.I_ObjectAddress); Matches := Matches + 1; end;
@@ -230,12 +325,16 @@ begin
                     Comp.GroupIterator_Destroy(Iter);
                 end;
                 if Matches <> 1 then begin ErrorText := 'Selector missing or ambiguous at index ' + IntToStr(I); Break; end;
+                if ErrorText <> '' then Break;
                 if Addresses.IndexOf(Address) >= 0 then begin ErrorText := 'Selectors refer to the same object'; Break; end;
                 Addresses.Add(Address);
             end;
             if ErrorText <> '' then Break;
-            PCBServer.PreProcess;
-            Editing := True;
+            if not IsPadProperties or NeedChanges then
+            begin
+                PCBServer.PreProcess;
+                Editing := True;
+            end;
             for I := 0 to Count - 1 do
             begin
                 ReportProgress;
@@ -250,20 +349,36 @@ begin
                         Prim := Iter.NextPCBObject;
                     end;
                     if Prim = nil then begin ErrorText := 'Preflight object disappeared'; Break; end;
-                    if IsPad then BeforeItems.Add(FootprintEditPadSnapshot(Prim))
+                    if IsPadProperties then BeforeItems.Add(FootprintPadPropertiesSnapshot(Prim))
+                    else if IsPad then BeforeItems.Add(FootprintEditPadSnapshot(Prim))
                     else AddJSONProperty(BeforeItems, IntToStr(I), Layer2String(Prim.Layer));
-                    PCBServer.SendMessageToRobots(Prim.I_ObjectAddress, c_Broadcast, PCBM_BeginModify, c_NoEventData);
-                    Updated := Updated + 1;
-                    try
-                        if IsPad then
-                            ErrorText := SetPadMaskExpansion(Prim, Spec.Values['paste_mode'], Spec.Values['paste_expansion'],
-                                                           Spec.Values['mask_mode'], Spec.Values['mask_expansion'])
-                        else Prim.Layer := FootprintEditLayer(FootprintEditValue(Spec, Prefix + 'to_layer'));
-                    finally
-                        PCBServer.SendMessageToRobots(Prim.I_ObjectAddress, c_Broadcast, PCBM_EndModify, c_NoEventData);
+                    DoEdit := True;
+                    if IsPadProperties then DoEdit := FootprintPadPropertiesChanged(Prim, Spec);
+                    if DoEdit then
+                    begin
+                        PCBServer.SendMessageToRobots(Prim.I_ObjectAddress, c_Broadcast, PCBM_BeginModify, c_NoEventData);
+                        Updated := Updated + 1;
+                        try
+                            if IsPadProperties then
+                            begin
+                                if Spec.IndexOfName('is_testpoint_top') >= 0 then Prim.IsTestpoint_Top := Spec.Values['is_testpoint_top'] = '1';
+                                if Spec.IndexOfName('is_testpoint_bottom') >= 0 then Prim.IsTestpoint_Bottom := Spec.Values['is_testpoint_bottom'] = '1';
+                            end
+                            else if IsPad then
+                                ErrorText := SetPadMaskExpansion(Prim, Spec.Values['paste_mode'], Spec.Values['paste_expansion'],
+                                                               Spec.Values['mask_mode'], Spec.Values['mask_expansion'])
+                            else Prim.Layer := FootprintEditLayer(FootprintEditValue(Spec, Prefix + 'to_layer'));
+                        finally
+                            PCBServer.SendMessageToRobots(Prim.I_ObjectAddress, c_Broadcast, PCBM_EndModify, c_NoEventData);
+                        end;
                     end;
                     if ErrorText <> '' then Break;
-                    if IsPad then
+                    if IsPadProperties then
+                    begin
+                        AfterItems.Add(FootprintPadPropertiesSnapshot(Prim));
+                        if not FootprintPadPropertiesChanged(Prim, Spec) then Verified := Verified + 1;
+                    end
+                    else if IsPad then
                     begin
                         AfterItems.Add(FootprintEditPadSnapshot(Prim));
                         if FootprintEditPadVerified(Prim, Spec) then Verified := Verified + 1;
@@ -284,14 +399,25 @@ begin
       except
         ErrorText := 'Footprint library API failure: ' + ExceptionMessage;
       end;
-      if Editing then PCBServer.PostProcess;
+      if Editing then
+      begin
+          PCBServer.PostProcess;
+          Editing := False;
+      end;
       if Updated > 0 then
       begin
+          if HaveProperties then PcbLib.Board.SetState_DocumentHasChanged;
           MarkDocumentModified(Path);
           PcbLib.Board.ViewManager_FullUpdate;
       end;
       AddJSONBoolean(Props, 'success', ErrorText = '');
       AddJSONBoolean(Props, 'saved', False);
+      if HaveProperties then
+      begin
+          AddJSONBoolean(Props, 'was_modified', WasModified);
+          AddJSONBoolean(Props, 'is_modified', Doc.Modified);
+          AddJSONBoolean(Props, 'changed', Updated > 0);
+      end;
       AddJSONBoolean(Props, 'may_have_partial_changes', (ErrorText <> '') and (Updated > 0));
       if ErrorText <> '' then AddJSONProperty(Props, 'error', ErrorText);
       if Command <> 'get_pcb_api_constants' then
@@ -313,6 +439,7 @@ begin
       end;
       Result := BuildJSONObject(Props);
     finally
+        if Editing then PCBServer.PostProcess;
         Spec.Free;
         Props.Free;
         Addresses.Free;

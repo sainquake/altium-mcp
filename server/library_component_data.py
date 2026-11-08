@@ -41,7 +41,7 @@ def prepare_request(path, symbol_name, parameters, footprint_models, comment, de
             text(name, "parameter name", True)
             text(value, "parameter value")
             if name.casefold() in names or name.casefold() in ("comment", "designator"):
-                raise ValueError("parameter names must be distinct; use comment separately; designator is unsupported")
+                raise ValueError("parameter names must be distinct; use comment separately and set_library_component_properties for Designator")
             names.add(name.casefold())
             spec[f"p{index}.name"] = name
             spec[f"p{index}.value"] = value

@@ -62,6 +62,28 @@ begin
     end;
 end;
 
+function LibraryComponentKindValue(Name: String): Integer;
+begin
+    Result := -1;
+    if Name = 'standard' then Result := eComponentKind_Standard;
+    if Name = 'mechanical' then Result := eComponentKind_Mechanical;
+    if Name = 'graphical' then Result := eComponentKind_Graphical;
+    if Name = 'net_tie_bom' then Result := eComponentKind_NetTie_BOM;
+    if Name = 'net_tie_no_bom' then Result := eComponentKind_NetTie_NoBOM;
+    if Name = 'standard_no_bom' then Result := eComponentKind_Standard_NoBOM;
+end;
+
+function LibraryComponentKindName(Value: Integer): String;
+begin
+    Result := 'unknown';
+    if Value = eComponentKind_Standard then Result := 'standard';
+    if Value = eComponentKind_Mechanical then Result := 'mechanical';
+    if Value = eComponentKind_Graphical then Result := 'graphical';
+    if Value = eComponentKind_NetTie_BOM then Result := 'net_tie_bom';
+    if Value = eComponentKind_NetTie_NoBOM then Result := 'net_tie_no_bom';
+    if Value = eComponentKind_Standard_NoBOM then Result := 'standard_no_bom';
+end;
+
 function LibraryComponentSnapshot(Comp: ISch_Component): String;
 var
     Iter: ISch_Iterator;
@@ -76,6 +98,10 @@ begin
     Models := TStringList.Create;
     try
         AddJSONProperty(Props, 'symbol_name', Comp.LibReference);
+        AddJSONProperty(Props, 'designator_template', Comp.Designator.Text);
+        AddJSONInteger(Props, 'designator_read_only_state', Comp.Designator.ReadOnlyState);
+        AddJSONProperty(Props, 'component_kind', LibraryComponentKindName(Comp.ComponentKind));
+        AddJSONInteger(Props, 'component_kind_code', Comp.ComponentKind);
         AddJSONProperty(Props, 'comment', Comp.Comment.Text);
         AddJSONProperty(Props, 'description', Comp.ComponentDescription);
         AddJSONInteger(Props, 'part_count', Comp.PartCount);
@@ -376,6 +402,21 @@ begin
             if EditHas(Spec, 'comment') then NeedChanges := Comp.Comment.Text <> EditValue(Spec, 'comment');
             if EditHas(Spec, 'description') then
                 NeedChanges := NeedChanges or (Comp.ComponentDescription <> EditValue(Spec, 'description'));
+            if EditHas(Spec, 'designator_template') then
+            begin
+                // Native Designator normally protects its name, not its value.
+                if Comp.Designator.Text <> EditValue(Spec, 'designator_template') then
+                begin
+                    if (Comp.Designator.ReadOnlyState <> eReadOnly_None) and
+                       (Comp.Designator.ReadOnlyState <> eReadOnly_Name) then ErrorText := 'Designator value is read-only';
+                    NeedChanges := True;
+                end;
+            end;
+            if EditHas(Spec, 'component_kind') then
+            begin
+                if LibraryComponentKindValue(EditValue(Spec, 'component_kind')) < 0 then ErrorText := 'unsupported component kind';
+                NeedChanges := NeedChanges or (Comp.ComponentKind <> LibraryComponentKindValue(EditValue(Spec, 'component_kind')));
+            end;
             for I := 0 to StrToInt(EditValue(Spec, 'parameter_count')) - 1 do
             begin
                 if ErrorText <> '' then Break;
@@ -466,6 +507,15 @@ begin
                 try
                     if EditHas(Spec, 'comment') then Comp.Comment.Text := EditValue(Spec, 'comment');
                     if EditHas(Spec, 'description') then Comp.ComponentDescription := EditValue(Spec, 'description');
+                    if EditHas(Spec, 'designator_template') then
+                        if Comp.Designator.Text <> EditValue(Spec, 'designator_template') then
+                        begin
+                            SchServer.RobotManager.SendMessage(Comp.Designator.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, 0);
+                            try Comp.Designator.Text := EditValue(Spec, 'designator_template');
+                            finally SchServer.RobotManager.SendMessage(Comp.Designator.I_ObjectAddress, c_BroadCast, SCHM_EndModify, 0); end;
+                        end;
+                    if EditHas(Spec, 'component_kind') then
+                        Comp.ComponentKind := LibraryComponentKindValue(EditValue(Spec, 'component_kind'));
                     for I := 0 to StrToInt(EditValue(Spec, 'parameter_count')) - 1 do
                     begin
                         Prefix := 'p' + IntToStr(I) + '.';
