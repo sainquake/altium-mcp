@@ -35,7 +35,8 @@ class SymbolPrimitivesTests(unittest.TestCase):
             rows.append({'index':i,'_id':obj['_id'],'unique_id':obj['unique_id']})
         changed=sum(a!=b for a,b in zip(self.objects,after))
         return dict(success=True,saved=False,library_path=str(self.library),symbol_name='LED',
-                    metadata_before={'models':['Keep'],'part_count':2},metadata_after={'models':['Keep'],'part_count':2},
+                    metadata_before={'symbol_name':'LED','models':['Keep'],'part_count':2},
+                    metadata_after={'symbol_name':'LED','models':['Keep'],'part_count':2},
                     component_uid_before='',component_uid_after='',_component_id_before='200',_component_id_after='200',
                     objects_before=copy.deepcopy(self.objects),objects_after=after,results=rows,
                     updated_count=changed,changed=bool(changed),was_modified=False,is_modified=bool(changed))
@@ -97,6 +98,15 @@ class SymbolPrimitivesTests(unittest.TestCase):
         self.assertFalse(result['changed'])
         self.assertEqual(result['component_uid_before'],'')
 
+    def test_empty_strings_require_explicit_readback(self):
+        edits=[{'target':{'type':'label','unique_id':'LABEL'},'properties':{'text':''}},
+               {'target':{'type':'pin','unique_id':'PIN'},'properties':{'pin_name':'','description':''}}]
+        editor.prepare(str(self.library),'LED',edits)
+        native=self.native(edits)
+        self.assertTrue(self.execute(native,edits=edits)['success'])
+        del native['objects_after'][0]['text']
+        self.assertFalse(self.execute(native,edits=edits)['success'])
+
     def test_noop_preserves_dirty_buffer(self):
         edit=copy.deepcopy(self.edit)
         edit['properties']['text']='RED'
@@ -111,11 +121,16 @@ class SymbolPrimitivesTests(unittest.TestCase):
         cases=[]
         for key,value in (('unique_id','REPLACED'),('owner_part_id',2),('display_mode',1),('color',0)):
             changed=copy.deepcopy(native);changed['objects_after'][0][key]=value;cases.append(changed)
-        changed=copy.deepcopy(native);changed['objects_after'][1]['pin_number']='3';cases.append(changed)
+        for key,value in (('pin_number','3'),('symbol_inside','clock'),('pin_parameters',{'parameters':[]})):
+            changed=copy.deepcopy(native);changed['objects_after'][1][key]=value;cases.append(changed)
         for changes in ({'component_uid_after':'NEW'},{'_component_id_after':'201'},
                         {'metadata_after':{'models':[]}},{'objects_after':native['objects_after'][:1]},
                         {'updated_count':0},{'is_modified':False},{'saved':True}):
             cases.append({**copy.deepcopy(native),**changes})
+        changed=copy.deepcopy(native)
+        for key in ('metadata_before','metadata_after'):
+            changed[key]['symbol_name']='ANOTHER_SYMBOL'
+        cases.append(changed)
         for case in cases:
             with self.subTest(case=case):
                 self.assertFalse(self.execute(case)['success'])

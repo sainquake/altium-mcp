@@ -122,6 +122,9 @@ def verify(result, spec, edits):
         errors.append("operation must not save")
     if result.get("metadata_before") != result.get("metadata_after") or not isinstance(result.get("metadata_before"), dict):
         errors.append("symbol metadata, models or parameters changed")
+    metadata = result.get("metadata_before")
+    if not isinstance(metadata, dict) or str(metadata.get("symbol_name", "")).casefold() != spec["symbol_name"].casefold():
+        errors.append("native symbol name mismatch")
     if not isinstance(result.get("component_uid_before"), str) or result.get("component_uid_before") != result.get("component_uid_after"):
         errors.append("symbol UID changed or is missing")
     if not result.get("_component_id_before") or result.get("_component_id_before") != result.get("_component_id_after"):
@@ -205,7 +208,7 @@ async def execute(bridge, exchange_dir, path, symbol_name, edits):
         result["verification"] = {"passed": result["success"] and not errors, "errors": errors}
         if errors:
             result.update(success=False, error="symbol primitive verification failed", may_have_partial_changes=bool(edits))
-        # Addresses are internal verification keys, never public selectors.
+        # Request-local interface IDs are verification keys, never public selectors.
         objects = result.pop("objects_after", [])
         result.pop("objects_before", None)
         result["objects"] = [{k:v for k,v in row.items() if k != "_id"} for row in objects if row.get("type") != "unsupported"]

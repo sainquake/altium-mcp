@@ -1283,7 +1283,7 @@ begin
         end;
     end
     else if (CommandName <> 'edit_schematic') and (CommandName <> 'get_schematic_connectivity') and
-       (CommandName <> 'set_library_component_data') and (CommandName <> 'update_symbol_primitives') and (CommandName <> 'clone_schematic_components') and
+       (CommandName <> 'set_library_component_data') and (CommandName <> 'update_symbol_primitives') and (CommandName <> 'remove_empty_library_component') and (CommandName <> 'clone_schematic_components') and
        (CommandName <> 'set_footprint_pad_settings') and (CommandName <> 'edit_footprint_primitives') and
        (CommandName <> 'get_pcb_api_constants') and (CommandName <> 'set_footprint_properties') and (CommandName <> 'set_footprint_pad_properties') and
        (CommandName <> 'set_schematic_sheet_properties') and (CommandName <> 'zoom_schematic') and
@@ -1367,6 +1367,8 @@ begin
             Result := ExecuteLibraryComponentData(RequestData);
         'update_symbol_primitives':
             Result := ExecuteUpdateSymbolPrimitives(RequestData);
+        'remove_empty_library_component':
+            Result := ExecuteRemoveEmptyLibraryComponent(RequestData);
         'create_document', 'open_document', 'save_document', 'add_document_to_project':
             Result := ExecuteManageDocument(CommandName, RequestData);
         'close_document':
@@ -1642,7 +1644,7 @@ begin
                 // which can show another project's document before validation.
                 if (CommandType <> 'select_project') and (CommandType <> 'open_project') and
                    (CommandType <> 'open_document') and (CommandType <> 'close_document') and
-                   (CommandType <> 'clone_schematic_components') and (CommandType <> 'update_symbol_primitives') and
+                   (CommandType <> 'clone_schematic_components') and (CommandType <> 'update_symbol_primitives') and (CommandType <> 'remove_empty_library_component') and
                    (CommandType <> 'set_footprint_pad_settings') and (CommandType <> 'edit_footprint_primitives') and
                    (CommandType <> 'get_pcb_api_constants') and (CommandType <> 'set_footprint_properties') and (CommandType <> 'set_footprint_pad_properties') and
                    (CommandType <> 'set_schematic_sheet_properties') and (CommandType <> 'zoom_schematic') and

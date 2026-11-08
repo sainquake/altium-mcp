@@ -1187,3 +1187,6 @@ DocumentPath=schematic_diagram.pas
 
 [Document16]
 DocumentPath=symbol_primitives.pas
+
+[Document17]
+DocumentPath=empty_library_component.pas

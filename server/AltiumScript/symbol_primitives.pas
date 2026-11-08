@@ -1,5 +1,17 @@
 // Existing SchLib objects only: no factory, delete, replicate or save calls.
 
+var
+    // Sch I_ObjectAddress is an opaque handle; keep request-local interface IDs.
+    UPObjects: TInterfaceList;
+
+function UPIdentity(Obj: ISch_GraphicalObject): String;
+var I: Integer;
+begin
+    I := UPObjects.IndexOf(Obj);
+    if I < 0 then I := UPObjects.Add(Obj);
+    Result := IntToStr(I);
+end;
+
 function UPType(Obj: ISch_GraphicalObject): String;
 begin
     Result := 'unsupported';
@@ -35,7 +47,9 @@ function UPStringKey(Key: String): Boolean;
 begin
     Result := (Key = 'type') or (Key = '_id') or (Key = 'unique_id') or
               (Key = 'text') or (Key = 'pin_name') or (Key = 'pin_number') or
-              (Key = 'description') or (Key = 'font_name');
+              (Key = 'description') or (Key = 'font_name') or
+              (Key = 'symbol_inside') or (Key = 'symbol_inside_edge') or
+              (Key = 'symbol_outside_edge') or (Key = 'symbol_outside');
 end;
 
 function UPBoolKey(Key: String): Boolean;
@@ -63,11 +77,11 @@ begin
         Kind := UPType(Obj);
         Step := 'identity';
         S.Values['type'] := Kind;
-        S.Values['_id'] := IntToStr(Obj.I_ObjectAddress);
+        S.Values['_id'] := UPIdentity(Obj);
         if Kind = 'unsupported' then S.Values['native_type'] := IntToStr(Obj.ObjectId)
         else
         begin
-            S.Values['unique_id'] := Obj.UniqueId;
+            S.Add('unique_id=' + Obj.UniqueId);
             S.Values['owner_part_id'] := IntToStr(Obj.OwnerPartId);
             S.Values['display_mode'] := IntToStr(Obj.OwnerPartDisplayMode);
             S.Values['color'] := IntToStr(Obj.Color);
@@ -125,7 +139,7 @@ begin
             begin
                 T := Obj;
                 F := T.FontId;
-                S.Values['text'] := T.Text;
+                S.Add('text=' + T.Text);
                 S.Values['x'] := UPCoord(T.Location.X); S.Values['y'] := UPCoord(T.Location.Y);
                 S.Values['orientation'] := IntToStr(T.Orientation);
                 S.Values['justification'] := IntToStr(T.Justification);
@@ -141,8 +155,8 @@ begin
             begin
                 Step := 'pin';
                 Pin := Obj;
-                S.Values['pin_number'] := Pin.Designator; S.Values['pin_name'] := Pin.Name;
-                S.Values['description'] := Pin.Description;
+                S.Add('pin_number=' + Pin.Designator); S.Add('pin_name=' + Pin.Name);
+                S.Add('description=' + Pin.Description);
                 S.Values['x'] := UPCoord(Pin.Location.X); S.Values['y'] := UPCoord(Pin.Location.Y);
                 S.Values['length'] := UPCoord(Pin.PinLength);
                 S.Values['orientation'] := IntToStr(Pin.Orientation);
@@ -150,6 +164,10 @@ begin
                 S.Values['show_name'] := UPBool(Pin.ShowName);
                 S.Values['show_designator'] := UPBool(Pin.ShowDesignator);
                 S.Values['is_hidden'] := UPBool(Pin.IsHidden);
+                S.Add('symbol_inside=' + IeeeSymbolName(Pin.Symbol_Inner));
+                S.Add('symbol_inside_edge=' + IeeeSymbolName(Pin.Symbol_InnerEdge));
+                S.Add('symbol_outside_edge=' + IeeeSymbolName(Pin.Symbol_OuterEdge));
+                S.Add('symbol_outside=' + IeeeSymbolName(Pin.Symbol_Outer));
                 PinProps := TStringList.Create;
                 try
                     AddPinParametersJSON(PinProps, Pin);
@@ -246,7 +264,7 @@ begin
         begin
             ReportProgress;
             Found := False;
-            if Address <> '' then Found := IntToStr(Obj.I_ObjectAddress) = Address
+            if Address <> '' then Found := UPIdentity(Obj) = Address
             else if UPType(Obj) <> 'unsupported' then
             begin
                 S := UPState(Obj);
@@ -339,15 +357,17 @@ var
     Doc: IServerDocument;
     LibIterator: ISch_Iterator;
     Obj: ISch_GraphicalObject;
-    Path, Name, SpecPath, ErrorText, BeforeJSON, BeforeMeta, BeforeUID, BeforeAddress, Prefix: String;
+    Path, Name, SpecPath, ErrorText, BeforeJSON, BeforeMeta, AfterJSON, AfterMeta, BeforeUID, BeforeAddress, Prefix: String;
     I, Count, Matches, Updated, FailedIndex: Integer;
-    Editing, Started, WasModified, NeedChanges: Boolean;
+    Editing, Started, WasModified, NeedChanges, HaveSnapshot: Boolean;
 begin
     Spec := TStringList.Create; Props := TStringList.Create;
     Addresses := TStringList.Create; Results := TStringList.Create;
+    UPObjects := TInterfaceList.Create;
     Lib := nil; Comp := nil; Doc := nil;
     Path := ''; Name := ''; ErrorText := ''; BeforeJSON := '[]'; BeforeMeta := '{}'; BeforeUID := ''; BeforeAddress := '';
     Updated := 0; FailedIndex := -1; Editing := False; Started := False; WasModified := False; NeedChanges := False;
+    HaveSnapshot := False;
     try
       try
         repeat
@@ -355,7 +375,6 @@ begin
             for I := 0 to Request.Count - 1 do if Pos('"spec_file"',Request[I])>0 then SpecPath := JSONLineValue(Request[I]);
             if not FileExists(SpecPath) then begin ErrorText := 'Spec file not found'; Break; end;
             Spec.LoadFromFile(SpecPath); Path := EditValue(Spec,'library_path'); Name := EditValue(Spec,'symbol_name');
-            LogScriptError('update_symbol_primitives: open target');
             if not FileExists(Path) then begin ErrorText := 'Library file not found'; Break; end;
             Doc := OpenLibraryDocument('SchLib',Path);
             if Doc = nil then begin ErrorText := 'Cannot open a unique library buffer'; Break; end;
@@ -364,42 +383,38 @@ begin
             if (Lib.ObjectId<>33) or (NormalizedPath(Lib.DocumentName)<>NormalizedPath(Path)) or
                (NormalizedPath(Doc.FileName)<>NormalizedPath(Path)) then begin ErrorText := 'Library identity mismatch'; Break; end;
             if SchServer.ProcessControl.ProcessDepth<>0 then begin ErrorText := 'Schematic editor has an active transaction'; Break; end;
-            LogScriptError('update_symbol_primitives: find symbol');
             Matches := 0;
             LibIterator := Lib.SchLibIterator_Create;
-            LogScriptError('update_symbol_primitives: iterator created');
             LibIterator.AddFilter_ObjectSet(MkSet(eSchComponent));
             try
                 Candidate := LibIterator.FirstSchObject;
-                LogScriptError('update_symbol_primitives: first symbol fetched');
                 while Candidate<>nil do
                 begin
-                    LogScriptError('update_symbol_primitives: candidate ' + Candidate.LibReference);
                     if SameText(Candidate.LibReference,Name) then begin Comp := Candidate; Matches := Matches+1; end;
                     Candidate := LibIterator.NextSchObject;
                 end;
             finally
-                LogScriptError('update_symbol_primitives: scan completed ' + IntToStr(Matches));
-                Lib.SchLibIterator_Destroy(LibIterator);
-                LogScriptError('update_symbol_primitives: iterator destroyed');
+                Lib.SchIterator_Destroy(LibIterator);
             end;
             if Matches<>1 then begin Comp := nil; ErrorText := 'Symbol missing or ambiguous'; Break; end;
-            LogScriptError('update_symbol_primitives: focus symbol');
             Lib.CurrentSchComponent := Comp;
+            Comp := Lib.CurrentSchComponent;
+            if Comp = nil then begin ErrorText := 'Focused symbol is unavailable'; Break; end;
+            if not SameText(Comp.LibReference,Name) then begin ErrorText := 'Focused symbol identity mismatch'; Break; end;
             WasModified := Doc.Modified;
-            LogScriptError('update_symbol_primitives: metadata');
-            BeforeUID := Comp.UniqueId; BeforeAddress := IntToStr(Comp.I_ObjectAddress);
+            BeforeUID := Comp.UniqueId;
+            BeforeAddress := UPIdentity(Comp);
             BeforeMeta := LibraryComponentSnapshot(Comp);
-            LogScriptError('update_symbol_primitives: object snapshot');
             BeforeJSON := UPSnapshot(Comp);
+            HaveSnapshot := True;
             Count := StrToInt(Spec.Values['count']);
             for I := 0 to Count-1 do
             begin
                 FailedIndex := I; Prefix := IntToStr(I)+'.';
                 Obj := UPFind(Comp,Spec,Prefix+'target.','',Matches);
                 if Matches<>1 then begin ErrorText := 'Target must match exactly once; found '+IntToStr(Matches); Break; end;
-                if Addresses.IndexOf(IntToStr(Obj.I_ObjectAddress))>=0 then begin ErrorText := 'Same object targeted twice'; Break; end;
-                Addresses.Add(IntToStr(Obj.I_ObjectAddress));
+                if Addresses.IndexOf(UPIdentity(Obj))>=0 then begin ErrorText := 'Same object targeted twice'; Break; end;
+                Addresses.Add(UPIdentity(Obj));
                 S := UPState(Obj);
                 try NeedChanges := NeedChanges or not UPMatches(S,Spec,Prefix+'properties.'); finally S.Free; end;
             end;
@@ -431,6 +446,14 @@ begin
       except ErrorText := ExceptionMessage; end;
       if Editing then begin SchServer.ProcessControl.PostProcess(Lib,''); Editing := False; end;
       if Started then begin MarkDocumentModified(Path); Lib.GraphicallyInvalidate; end;
+      AfterMeta := BeforeMeta; AfterJSON := BeforeJSON;
+      if HaveSnapshot then
+      begin
+          try
+              AfterMeta := LibraryComponentSnapshot(Comp);
+              AfterJSON := UPSnapshot(Comp);
+          except ErrorText := 'After snapshot failed: ' + ExceptionMessage; end;
+      end;
       AddJSONBoolean(Props,'success',ErrorText=''); AddJSONBoolean(Props,'saved',False);
       AddJSONProperty(Props,'library_path',Path); AddJSONProperty(Props,'symbol_name',Name);
       AddJSONBoolean(Props,'changed',Updated>0); AddJSONInteger(Props,'updated_count',Updated);
@@ -444,13 +467,14 @@ begin
       if Comp<>nil then
       begin
           AddJSONProperty(Props,'component_uid_after',Comp.UniqueId);
-          AddJSONProperty(Props,'_component_id_after',IntToStr(Comp.I_ObjectAddress));
-          Props.Add('"metadata_after":'+LibraryComponentSnapshot(Comp)); Props.Add('"objects_after":'+UPSnapshot(Comp));
+          AddJSONProperty(Props,'_component_id_after',UPIdentity(Comp));
+          Props.Add('"metadata_after":'+AfterMeta); Props.Add('"objects_after":'+AfterJSON);
       end;
       Props.Add('"results":'+BuildJSONArray(Results));
       Result := BuildJSONObject(Props);
     finally
         if Editing then SchServer.ProcessControl.PostProcess(Lib,'');
         Spec.Free; Props.Free; Addresses.Free; Results.Free;
+        UPObjects.Free;
     end;
 end;

@@ -46,6 +46,7 @@ import schematic_document
 import library_component_properties
 import schematic_diagram
 import symbol_primitives
+import empty_library_component
 import footprint_editor
 import project_selection
 import lcsc_catalog
@@ -168,7 +169,7 @@ MUTATING_COMMANDS = {
     "move_components", "place_components", "create_symbols_batch", "build_circuit",
     "create_footprints_batch", "layout_duplicator", "layout_duplicator_apply",
     "run_output_jobs", "create_pcb_footprint", "edit_schematic", "edit_schematic_actions",
-    "set_library_component_data", "update_symbol_primitives", "create_document", "open_document", "save_document",
+    "set_library_component_data", "update_symbol_primitives", "remove_empty_library_component", "create_document", "open_document", "save_document",
     "add_document_to_project", "open_project", "select_project", "close_document", "clone_schematic_components",
     "set_footprint_pad_settings", "edit_footprint_primitives", "set_footprint_properties", "set_footprint_pad_properties",
     "set_schematic_sheet_properties", "save_project", "edit_sheet_symbols", "draw_block_diagram",
@@ -2671,6 +2672,31 @@ async def set_library_component_lcsc_data(ctx: Context, library_path: str, symbo
 
 
 @_tool()
+async def remove_empty_library_component(ctx: Context, library_path: str, component_name: str,
+                                         dry_run: bool = False) -> str:
+    """Remove one genuinely empty SchLib/PcbLib member, without saving documents.
+
+    Exact absolute .SchLib/.PcbLib path, saved or already open with a new unsaved
+    name. Reuses dirty buffers; component_name matches exactly, case-insensitively.
+    Intended for Component_1 / PCBComponent_1 after creating the real component.
+    dry_run=True reports native content assessment and blockers without deleting.
+
+    Any pins, graphics (including hidden/other-part objects), custom parameters,
+    models, description, nondefault Comment/designator, component kind, multipart
+    or alternate modes, linked symbol identity, or nonzero footprint height blocks
+    removal. Native default symbol Designator/Comment placeholders are allowed.
+    An unreadable property fails closed. Refuses the last library member: create
+    the real symbol/footprint first. Missing members are idempotent no-ops.
+
+    Verifies the target disappeared, other member identities/counts/metadata and
+    the file hash/timestamp stayed unchanged. Marks only a changed library dirty.
+    Never deletes a file, updates placed parts, compiles or saves. Inspect
+    may_have_partial_changes/outcome_unknown before retrying failed mutations.
+    """
+    return await empty_library_component.execute(altium_bridge, EXCHANGE_DIR, library_path, component_name, dry_run)
+
+
+@_tool()
 async def update_symbol_primitives(ctx: Context, library_path: str, symbol_name: str, edits: list) -> str:
     """Update existing SchLib labels, drawing objects and pins in place; never save.
 
@@ -3198,6 +3224,10 @@ async def get_symbol_primitives(ctx: Context, library_path: str = "", symbol_nam
              symbol_outside_edge and symbol_outside (IEEE symbol names as
              PINSYMBOL takes them), and their parameters [{name, value}]
              when they have any
+
+    Use update_symbol_primitives(library_path, symbol_name, []) for editable
+    object selectors/UIDs; pass edits there to change existing graphics or pins
+    without recreating the symbol. This getter remains the broader inventory.
     """
     logger.info(f"Getting symbol primitives (library={library_path}, symbol={symbol_name})")
 
