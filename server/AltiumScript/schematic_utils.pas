@@ -207,7 +207,8 @@ begin
 end;
 
 function CreateSchematicSymbol(SymbolName, Description: String; PinsList, GraphicsList,
-                               Parameters: TStringList; PartCount: Integer = 1): String;
+                               Parameters: TStringList; PartCount: Integer = 1;
+                               DesignatorTemplate: String = 'U?'; ComponentKindName: String = 'standard'): String;
 var
     CurrentLib       : ISch_Lib;
     SchComponent     : ISch_Component;
@@ -221,7 +222,7 @@ var
     SchLabel         : ISch_Label;
     Parameter, ValueParameter : ISch_Parameter;
     ClientDoc        : IServerDocument;
-    I, J, PinCount   : Integer;
+    I, J, PinCount, KindValue: Integer;
     GraphicsCount    : Integer;
     Entry            : String;
     FieldValue       : String;
@@ -246,6 +247,9 @@ begin
         Result := 'ERROR: ' + Result;
         Exit;
     end;
+    KindValue := LibraryComponentKindValue(ComponentKindName);
+    if KindValue < 0 then begin Result := 'ERROR: Unsupported component kind'; Exit; end;
+    if DesignatorTemplate = '' then begin Result := 'ERROR: Empty designator template'; Exit; end;
     // Check if we have a schematic library document
     CurrentLib := SchServer.GetCurrentSchDocument;
     if CurrentLib = nil then
@@ -305,7 +309,8 @@ begin
     // Define the LibReference and component description
     SchComponent.LibReference := SymbolName;
     SchComponent.ComponentDescription := Description;
-    SchComponent.Designator.Text := 'U?';
+    SchComponent.Designator.Text := DesignatorTemplate;
+    SchComponent.ComponentKind := KindValue;
     SchComponent.Comment.Text := Parameters.Values['MP'];
     SchComponent.Comment.IsHidden := True;
     ValueParameter := nil;
@@ -853,14 +858,14 @@ begin
 end;
 
 // Create one symbol and retain its actual metadata readback, including failures.
-function BatchCreateOne(SymName, SymDesc: String; PartCount: Integer;
+function BatchCreateOne(SymName, SymDesc: String; PartCount: Integer; SymDesignator, SymKind: String;
                         PinsList, GraphicsList, ParametersList, ComponentsArray: TStringList): Boolean;
 var
     R: String;
 begin
     Result := False;
     if (SymName = '') then Exit;
-    R := CreateSchematicSymbol(SymName, SymDesc, PinsList, GraphicsList, ParametersList, PartCount);
+    R := CreateSchematicSymbol(SymName, SymDesc, PinsList, GraphicsList, ParametersList, PartCount, SymDesignator, SymKind);
     Result := (Pos('"success": true', R) > 0);
     if Result then ComponentsArray.Add(R)
     else ComponentsArray.Add('{"success": false, "component_name": "' + JSONEscapeString(SymName) +
@@ -903,7 +908,7 @@ end;
 // (Mode 'EDITSYMBOL' - never created when missing), then apply its edit
 // records. Returns 1 created, 2 edited, 0 nothing to do, -1 failed (the name
 // is added to Failed, the reason to Problems).
-function BatchFlushSymbol(Mode, SymName, SymDesc: String; PartCount: Integer;
+function BatchFlushSymbol(Mode, SymName, SymDesc: String; PartCount: Integer; SymDesignator, SymKind: String;
     PinsList, GraphicsList, ParametersList, ComponentsArray, EditsList, Failed, Problems: TStringList): Integer;
 var
     Lib  : ISch_Lib;
@@ -914,7 +919,7 @@ begin
 
     if (Mode = 'SYMBOL') then
     begin
-        if not BatchCreateOne(SymName, SymDesc, PartCount, PinsList, GraphicsList, ParametersList, ComponentsArray) then
+        if not BatchCreateOne(SymName, SymDesc, PartCount, SymDesignator, SymKind, PinsList, GraphicsList, ParametersList, ComponentsArray) then
         begin
             Failed.Add('"' + JSONEscapeString(SymName) + '"');
             Result := -1;
@@ -951,7 +956,7 @@ end;
 // file is plain text, one record per line, pipe-delimited (no JSON, so field
 // text is preserved exactly):
 //   LIBRARY|<path to .SchLib>            (optional first line - focus/open)
-//   SYMBOL|<name>|<description>|<part_count>   start a new symbol
+//   SYMBOL|<name>|<description>|<part_count>[|designator_template[|component_kind]]
 //   PARAM|<name>|<value>                 creation metadata
 //   EDITSYMBOL|<name>                    start editing an existing symbol
 //   PIN|<same fields as create_schematic_symbol pins>      (SYMBOL only)
@@ -979,7 +984,7 @@ var
     LibPath       : String;
     Mode          : String;
     CurrentName   : String;
-    CurrentDesc   : String;
+    CurrentDesc, CurrentDesignator, CurrentKind: String;
     FieldValue, ParameterName : String;
     PartCount     : Integer;
     CreatedCount  : Integer;
@@ -1005,6 +1010,7 @@ begin
     Mode := '';
     CurrentName := '';
     CurrentDesc := '';
+    CurrentDesignator := 'U?'; CurrentKind := 'standard';
     PartCount := 1;
     CreatedCount := 0;
     EditedCount := 0;
@@ -1044,7 +1050,7 @@ begin
             else if (Kind = 'SYMBOL') or (Kind = 'EDITSYMBOL') or (Kind = 'END') then
             begin
                 // Finish the previous symbol
-                Outcome := BatchFlushSymbol(Mode, CurrentName, CurrentDesc, PartCount,
+                Outcome := BatchFlushSymbol(Mode, CurrentName, CurrentDesc, PartCount, CurrentDesignator, CurrentKind,
                                             PinsList, GraphicsList, ParametersList, ComponentsArray,
                                             EditsList, FailedArray, ProblemsArray);
                 if (Outcome = 1) then
@@ -1058,6 +1064,7 @@ begin
                 Mode := Kind;
                 CurrentName := Trim(GetFieldFromPipeString(Line, 1));
                 CurrentDesc := '';
+                CurrentDesignator := 'U?'; CurrentKind := 'standard';
                 PartCount := 1;
                 if (Kind = 'SYMBOL') then
                 begin
@@ -1065,6 +1072,10 @@ begin
                     FieldValue := Trim(GetFieldFromPipeString(Line, 3));
                     if (FieldValue <> '') then
                         PartCount := StrToInt(FieldValue);
+                    FieldValue := Trim(GetFieldFromPipeString(Line, 4));
+                    if FieldValue <> '' then CurrentDesignator := FieldValue;
+                    FieldValue := Trim(GetFieldFromPipeString(Line, 5));
+                    if FieldValue <> '' then CurrentKind := FieldValue;
                 end;
             end
             else if (Kind = 'PARAM') then
@@ -1166,7 +1177,7 @@ end;
 // Get the graphic primitives of symbols in a schematic library.
 // SymbolName = '' -> inventory mode: every symbol with per-type primitive
 // counts. SymbolName given -> full geometry dump of that symbol (mils).
-function GetSymbolPrimitives(ROOT_DIR: String; LibraryPath: String; SymbolName: String): String;
+function GetSymbolPrimitivesJSON(ROOT_DIR: String; LibraryPath: String; SymbolName: String): String;
 var
     CurrentLib   : ISch_Lib;
     LibIterator  : ISch_Iterator;
@@ -1506,17 +1517,21 @@ begin
             Exit;
         end;
 
-        OutputLines := TStringList.Create;
-        try
-            OutputLines.Text := BuildJSONObject(ResultProps);
-            Result := WriteJSONToFile(OutputLines, ROOT_DIR + '\temp_symbol_primitives.json');
-        finally
-            OutputLines.Free;
-        end;
+        Result := BuildJSONObject(ResultProps);
     finally
         ResultProps.Free;
         SymbolsArray.Free;
     end;
+end;
+
+function GetSymbolPrimitives(ROOT_DIR: String; LibraryPath: String; SymbolName: String): String;
+var Value: String; Lines: TStringList;
+begin
+    Value := GetSymbolPrimitivesJSON(ROOT_DIR,LibraryPath,SymbolName);
+    if Pos('ERROR:',Value)=1 then begin Result := Value; Exit; end;
+    Lines := TStringList.Create;
+    try Lines.Text := Value; Result := WriteJSONToFile(Lines,ROOT_DIR+'\temp_symbol_primitives.json');
+    finally Lines.Free; end;
 end;
 
 // Function to get all schematic component data

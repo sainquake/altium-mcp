@@ -46,7 +46,7 @@ class SymbolMetadataTest(unittest.TestCase):
     def result(self, name="R-10K", description=DESCRIPTION, parameters=None):
         return {"success": True, "saved": False, "component_name": name,
                 "metadata": {"description": description, "parameters": dict(PARAMETERS if parameters is None else parameters),
-                             "comment": PARAMETERS["MP"]}}
+                             "comment": PARAMETERS["MP"], "designator_template": "U?", "component_kind": "standard"}}
 
     def tool(self, name, execute):
         tree = ast.parse((Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8"))
@@ -190,6 +190,61 @@ class SymbolMetadataTest(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertEqual(result["failed"], ["EXISTING"])
         self.assertEqual(result["problems"], ["EXISTING: pin not found"])
+
+    def test_batch_creation_properties_defaults_blank_fields_and_aliases(self):
+        cases=[('',1,'U?','standard'),('|2',2,'U?','standard'),('|1|J?',1,'J?','standard'),
+               ('|||Standard (No BOM)',1,'U?','standard_no_bom'),('|2|D?|Net Tie (In BOM)',2,'D?','net_tie_bom')]
+        for suffix,parts,designator,kind in cases:
+            text=self.block().replace('SYMBOL|R-10K|'+DESCRIPTION+'|1','SYMBOL|R-10K|'+DESCRIPTION+suffix)
+            with self.subTest(suffix=suffix):
+                prepared,symbols=data.prepare_batch(str(self.batch(text)))
+                self.assertEqual(symbols[0]['designator_template'],designator)
+                self.assertEqual(symbols[0]['component_kind'],kind)
+                self.assertEqual(symbols[0]['part_count'],parts)
+                self.assertIn(f'SYMBOL|R-10K|{DESCRIPTION}|{parts}|{designator}|{kind}',prepared)
+
+    def test_batch_creation_properties_accept_all_supported_native_kinds(self):
+        from library_component_properties import KINDS
+        for kind,label in KINDS.items():
+            text=self.block().replace('|'+DESCRIPTION+'|1','|'+DESCRIPTION+'|1|J?|'+label,1)
+            with self.subTest(kind=kind):
+                _,symbols=data.prepare_batch(str(self.batch(text)))
+                self.assertEqual(symbols[0]['component_kind'],kind)
+
+    def test_invalid_later_creation_properties_preflight_without_a_native_call(self):
+        tool,bridge=self.tool('create_symbols_batch',lambda *_:None)
+        bad=['|1|J1|standard','|1|1J?|standard','|1|J??|standard','|1|\u0416?|standard',
+             '|1|'+'A'*64+'?|standard','|1|J?|unknown','|1|J?|5','|1|J?|standard|extra']
+        for suffix in bad:
+            second=self.block('SECOND').replace('|'+DESCRIPTION+'|1','|'+DESCRIPTION+suffix,1)
+            with self.subTest(suffix=suffix):
+                path=self.batch(self.block()+'\n'+second)
+                result=json.loads(asyncio.run(tool(None,str(path))))
+                self.assertFalse(result['success']);self.assertFalse(result['may_have_partial_changes'])
+                bridge.execute_command.assert_not_awaited()
+        with self.assertRaises(ValueError):
+            data.prepare_batch(str(self.batch('EDITSYMBOL|EXISTING|J?|standard')))
+
+    def test_batch_properties_dispatch_once_and_verify_native_readback(self):
+        path=self.batch(self.block().replace('|'+DESCRIPTION+'|1','|'+DESCRIPTION+'|1|D?|Standard (No BOM)',1))
+        original=path.read_bytes()
+        async def execute(command,params):
+            self.assertEqual(command,'create_symbols_batch')
+            self.assertIn('|1|D?|standard_no_bom',read_altium_text(params['spec_file']))
+            item=self.result();item['metadata'].update(designator_template='D?',component_kind='standard_no_bom')
+            return {'success':True,'result':dict(created=1,edited=0,saved=False,components=[item],failed=[],problems=[])}
+        tool,bridge=self.tool('create_symbols_batch',execute)
+        result=json.loads(asyncio.run(tool(None,str(path))))
+        self.assertTrue(result['success']);self.assertEqual(bridge.execute_command.await_count,1)
+        self.assertEqual(path.read_bytes(),original)
+        for field in ('designator_template','component_kind'):
+            item=self.result();item['metadata'].update(designator_template='D?',component_kind='standard_no_bom')
+            item['metadata'][field]='wrong'
+            bridge.execute_command.side_effect=None
+            bridge.execute_command.return_value={'success':True,'result':dict(created=1,components=[item],failed=[],problems=[])}
+            result=json.loads(asyncio.run(tool(None,str(path))))
+            self.assertFalse(result['success']);self.assertTrue(result['may_have_partial_changes'])
+            self.assertIn('native '+field+' mismatch',result['verification']['errors'])
 
 
 if __name__ == "__main__":

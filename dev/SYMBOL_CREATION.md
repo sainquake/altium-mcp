@@ -81,6 +81,33 @@ The example data is illustrative. Replace it with actual component data.
 
 ## Batch creation
 
+Creation headers accept optional native properties:
+
+```text
+SYMBOL|name|description[|part_count[|designator_template[|component_kind]]]
+```
+
+Omitted/blank optional fields default to `1`, `U?`, `standard`. Old two/three-
+field headers after `SYMBOL` remain valid. For example, `|1|J?|standard` selects
+a connector prefix; `|1|D?|Standard (No BOM)` sets a diode prefix and native
+No BOM kind. To specify only the kind, leave the preceding slots blank:
+`SYMBOL|name|description|||standard_no_bom`.
+
+Designators follow the existing [native properties rules](LIBRARY_COMPONENT_PROPERTIES.md):
+a letter, then letters/digits/underscore, followed by one `?`, at most 64
+characters. Kinds are `standard`, `mechanical`, `graphical`, `net_tie_bom`,
+`net_tie_no_bom`, `standard_no_bom`; case-insensitive UI labels also work,
+including `Standard (No BOM)`, `Net Tie (In BOM)` and `Net Tie`. Python normalizes
+labels and validates every header before any Altium call. Invalid properties
+in a later symbol reject the entire request without creating earlier symbols.
+
+Both fields are set on the newly allocated native component inside its creation
+transaction, before it is registered in the library. No follow-up property tool,
+custom Designator/BOM parameter or extra property-edit transaction is used.
+Defaults reset for each symbol. `EDITSYMBOL|name` keeps its existing syntax and
+does not accept these creation-only header fields. The single-symbol MCP tool's
+signature and default `U?`/`standard` behavior are unchanged.
+
 Upstream's `EDITSYMBOL`, `COMMENT`, `DESCRIPTION`, `SYMPARAM`, `PINPARAM`,
 `PINDESC` and `PINSYMBOL` records are supported alongside `PARAM`. Existing-symbol
 edit blocks do not require the creation metadata schema and never create a
@@ -94,7 +121,7 @@ Add a complete set of `PARAM|name|value` records for **each** symbol:
 
 ```text
 LIBRARY|C:\Libraries\Parts.SchLib
-SYMBOL|R-10K|Resistor, 10k, 1%, 100mW, 0603 SMD|1
+SYMBOL|R-10K|Resistor, 10k, 1%, 100mW, 0603 SMD|1|R?|standard
 PARAM|Value|10k
 PARAM|MF|Example
 PARAM|MP|R-10K
@@ -118,7 +145,9 @@ The tool sends a unique BOM-marked UTF-8 copy, leaving the input file unchanged.
 ## Readback, failures and loading the update
 
 Creation returns actual `metadata`, `verification`, and `saved=false`. Readback
-compares all requested parameters, native Description and Comment. Batch output
+compares all requested parameters, native Description and Comment. Batch creation
+also verifies native Designator and ComponentKind, including the legacy defaults,
+after all property edits. Batch output
 also contains a per-symbol `components` list. A mismatch makes `success=false`.
 API failures or timeouts can leave partial in-memory changes; inspect the result
 before retrying. No atomic rollback is promised. Uncertain bridge failures retain
@@ -136,3 +165,30 @@ python dev/test_symbol_creation_live.py --schlib 'C:\Project\Symbols.SchLib'
 
 The live runner creates test symbols only in an unsaved scratch copy under the
 toolkit's `.altium-mcp` directory and verifies source metadata and disk hashes.
+
+Native batch-property regression:
+
+```powershell
+python dev/test_batch_symbol_properties_live.py --exercise --schlib C:\Design\Symbols.SchLib
+```
+
+It creates all six kinds in one batch, checks optional/default fields, native
+readback, Unicode parameters and multipart handling, rejects malformed later
+headers, tests the unchanged single-symbol entry point, and discards the scratch
+library without saving. Existing symbols, original project states and guarded
+file hashes/timestamps are checked.
+
+Verified in Altium on 2026-11-10. The 15-step run
+`.altium-mcp/batch_symbol_properties_20261110_102713/report.json` created nine
+symbols in one batch: all six native kinds, UI-label aliases, custom/default
+Designator templates, a multipart symbol and legacy/partially omitted headers.
+Native batch readback confirmed properties, pins and Unicode parameters without
+follow-up property writes. A separate old single-symbol call retained
+`U?`/`standard`. Invalid Designator/kind in a later block created nothing.
+The scratch library was discarded; an existing symbol, original project states
+and all 12 guarded file hashes/timestamps remained unchanged. No document saved.
+
+Regression: 238 selected tests, 237 passed and one platform-specific skip.
+The four new batch-property tests cover defaults/aliases, all kinds, preflight
+without native calls and native property readback mismatches. Fresh MCP catalog
+inspection confirmed the extended format and unchanged `spec_file` signature.

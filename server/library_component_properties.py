@@ -32,13 +32,17 @@ def kind(value):
     return names[key]
 
 
+def designator(value):
+    if not isinstance(value, str) or len(value) > 64 or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*\?", value):
+        raise ValueError("designator_template must be a prefix followed by one '?', e.g. J?, D? or C?; prefix: letters/digits/underscore, starting with a letter (max 64 characters)")
+    return value
+
+
 def prepare(library_path, symbol_name, designator_template=None, component_kind=None):
     spec = prepare_request(library_path, symbol_name, None, None, None, None)
     requested = {}
     if designator_template is not None:
-        if not isinstance(designator_template, str) or len(designator_template) > 64 or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*\?", designator_template):
-            raise ValueError("designator_template must be a prefix followed by one '?', e.g. J?, D? or C?; prefix: letters/digits/underscore, starting with a letter (max 64 characters)")
-        requested["designator_template"] = designator_template
+        requested["designator_template"] = designator(designator_template)
     if component_kind is not None:
         requested["component_kind"] = kind(component_kind)
     spec += "".join(f"{k}={json.dumps(v, ensure_ascii=False)[1:-1]}\n" for k, v in requested.items())

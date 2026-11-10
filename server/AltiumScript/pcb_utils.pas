@@ -413,7 +413,7 @@ end;
 // '*' -> full dump of every footprint; name -> dump that footprint.
 // Coordinates in mils, layers as names, shapes/hole types as raw enum ints
 // (pass-through symmetric with create_footprints_batch).
-function GetFootprintPrimitives(ROOT_DIR: String; LibraryPath: String; FootprintName: String): String;
+function GetFootprintPrimitivesJSON(ROOT_DIR: String; LibraryPath: String; FootprintName: String): String;
 var
     PcbLib      : IPCB_Library;
     LibComp     : IPCB_LibComponent;
@@ -760,17 +760,21 @@ begin
             Exit;
         end;
 
-        OutputLines := TStringList.Create;
-        try
-            OutputLines.Text := BuildJSONObject(ResultProps);
-            Result := WriteJSONToFile(OutputLines, ROOT_DIR + '\temp_footprint_primitives.json');
-        finally
-            OutputLines.Free;
-        end;
+        Result := BuildJSONObject(ResultProps);
     finally
         ResultProps.Free;
         FPArray.Free;
     end;
+end;
+
+function GetFootprintPrimitives(ROOT_DIR: String; LibraryPath: String; FootprintName: String): String;
+var Value: String; Lines: TStringList;
+begin
+    Value := GetFootprintPrimitivesJSON(ROOT_DIR,LibraryPath,FootprintName);
+    if Pos('ERROR:',Value)=1 then begin Result := Value; Exit; end;
+    Lines := TStringList.Create;
+    try Lines.Text := Value; Result := WriteJSONToFile(Lines,ROOT_DIR+'\temp_footprint_primitives.json');
+    finally Lines.Free; end;
 end;
 
 

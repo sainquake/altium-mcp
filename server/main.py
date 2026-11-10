@@ -50,6 +50,7 @@ import empty_library_component
 import library_view
 import library_components_data
 import library_validation
+import library_roundtrip
 import footprint_editor
 import project_selection
 import lcsc_catalog
@@ -172,7 +173,7 @@ MUTATING_COMMANDS = {
     "move_components", "place_components", "create_symbols_batch", "build_circuit",
     "create_footprints_batch", "layout_duplicator", "layout_duplicator_apply",
     "run_output_jobs", "create_pcb_footprint", "edit_schematic", "edit_schematic_actions",
-    "set_library_component_data", "update_symbol_primitives", "remove_empty_library_component", "set_library_view", "create_document", "open_document", "save_document",
+    "set_library_component_data", "update_symbol_primitives", "remove_empty_library_component", "set_library_view", "verify_library_roundtrip", "create_document", "open_document", "save_document",
     "add_document_to_project", "open_project", "select_project", "close_document", "clone_schematic_components",
     "set_footprint_pad_settings", "edit_footprint_primitives", "set_footprint_properties", "set_footprint_pad_properties",
     "set_schematic_sheet_properties", "save_project", "edit_sheet_symbols", "draw_block_diagram",
@@ -2674,6 +2675,37 @@ async def set_library_component_lcsc_data(ctx: Context, library_path: str, symbo
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 
+@_tool()
+async def verify_library_roundtrip(ctx: Context, library_paths: str | list[str], save: bool = False,
+                                   max_differences: int = 100, coordinate_tolerance_mils: float = .001) -> str:
+    """Compare whole SchLib/PcbLib buffers across an actual close and reopen.
+
+    library_paths: one absolute path or 1..8 distinct saved/open named unsaved
+    library paths. Default save=False never saves and refuses any dirty/unsaved
+    target before closing ANY library. save=True explicitly saves ALL contents
+    of exactly these libraries; use only with user authorization. Existing files
+    are backed up centrally before saves. Never saves sheets or projects.
+
+    Compares all members: geometry, parameters/fonts/visibility, native library
+    properties, model/datafile/pin-pad bindings and exposed 3D body data. Reads
+    saved STEP placements and hashes used embedded decompressed/linked payloads.
+    Dirty PcbLib STEP rotations/payload are unavailable before save: reports that
+    gap and equivalent=None unless an observed difference makes it False.
+    Unknown primitives/custom stacks also remain explicit coverage gaps.
+    equivalent=True applies to fully covered exposed data, not 3D rendering.
+
+    Preserves originally open/closed editors, members/parts/display and previous
+    view; clean closes only, no discard. Restores original focused project.
+    No-save hash/timestamp verification. Coordinate tolerance in mils, 0..1;
+    max_differences caps output only, not comparisons. Full snapshots, backups
+    and report are under the toolkit exchange directory. Incomplete native
+    completion stops; inspect outcome_unknown/save_outcome_unknown before retry.
+    See dev/LIBRARY_ROUNDTRIP.md for coverage and save semantics.
+    """
+    return await library_roundtrip.execute(altium_bridge, EXCHANGE_DIR, library_paths, save,
+                                            max_differences, coordinate_tolerance_mils)
+
+
 @_tool(read_only=True)
 async def validate_library_components(ctx: Context, library_paths: str | list[str],
                                        component_names: Optional[list[str]] = None,
@@ -3194,7 +3226,13 @@ async def create_symbols_batch(ctx: Context, spec_file: str) -> str:
             LIBRARY|<path to .SchLib>   (optional first line: opens/focuses;
                                          an already-open library is only
                                          focused, never reloaded)
-            SYMBOL|<name>|<description>|<part_count>
+            SYMBOL|<name>|<description>[|part_count[|designator_template[|component_kind]]]
+                Defaults: 1, U?, standard. Examples: |1|J?|standard or
+                |1|D?|Standard (No BOM). Blank optional fields use defaults.
+                Native ComponentKind names: standard, mechanical, graphical,
+                net_tie_bom, net_tie_no_bom, standard_no_bom; UI labels accepted.
+                Creation-only header fields, validated across the whole batch;
+                set inside the creation transaction, not as custom parameters.
             PARAM|<name>|<value>   (required metadata for each SYMBOL)
             PIN|<same pipe fields as create_schematic_symbol pins>
             GRAPHIC|<same entry format as create_schematic_symbol graphics>
@@ -3290,7 +3328,8 @@ async def create_symbols_batch(ctx: Context, spec_file: str) -> str:
     for item, request in zip(results, symbols):
         if item.get("component_name") != request["symbol_name"]:
             errors.append("created-symbol order/name mismatch")
-        symbol_metadata.verify(item, request["description"], request["parameters"], request.get("comment"))
+        symbol_metadata.verify(item, request["description"], request["parameters"], request.get("comment"),
+                               request["designator_template"], request["component_kind"])
         errors.extend(item["verification"]["errors"])
     result["verification"] = {"passed": not errors, "errors": errors}
     result["success"] = not errors and not result.get("failed") and not result.get("problems") and result.get("created") == len(symbols)

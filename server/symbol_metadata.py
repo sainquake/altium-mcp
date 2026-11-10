@@ -5,6 +5,7 @@ from pathlib import Path, PureWindowsPath
 from urllib.parse import urlsplit
 
 from altium_files import read_altium_text
+from library_component_properties import designator, kind as component_kind
 
 
 REQUIRED_PARAMETERS = ("Value", "MF", "MP", "HelpURL", "Package", "Type", "Instructions", "System")
@@ -119,8 +120,8 @@ def prepare_batch(spec_file):
             elif kind in {"SYMBOL", "EDITSYMBOL"}:
                 finish()
                 fields = rest.split("|")
-                if kind == "SYMBOL" and len(fields) not in (2, 3):
-                    raise ValueError("expected SYMBOL|name|description[|part_count]; description cannot contain |")
+                if kind == "SYMBOL" and not 2 <= len(fields) <= 5:
+                    raise ValueError("expected SYMBOL|name|description[|part_count[|designator_template[|component_kind]]]; description cannot contain |")
                 if kind == "EDITSYMBOL" and len(fields) != 1:
                     raise ValueError("expected EDITSYMBOL|name")
                 name = fields[0].strip()
@@ -132,8 +133,13 @@ def prepare_batch(spec_file):
                 block_count += 1
                 current = {"mode": kind, "header": kind + "|" + rest, "records": [],
                            "symbol_name": name, "description": fields[1] if kind == "SYMBOL" else "",
-                           "part_count": int(fields[2]) if len(fields) == 3 and fields[2].strip() else 1,
+                           "part_count": int(fields[2]) if len(fields) >= 3 and fields[2].strip() else 1,
                            "parameters": {}, "param_names": set(), "pins": [], "graphics": []}
+                if kind == "SYMBOL":
+                    current["designator_template"] = designator(fields[3].strip() if len(fields) >= 4 and fields[3].strip() else "U?")
+                    current["component_kind"] = component_kind(fields[4].strip() if len(fields) >= 5 and fields[4].strip() else "standard")
+                    current["header"] = "|".join((kind, fields[0], fields[1], str(current["part_count"]),
+                                                  current["designator_template"], current["component_kind"]))
             elif current is None:
                 raise ValueError("expected SYMBOL before component records")
             elif kind == "PARAM":
@@ -178,7 +184,7 @@ def prepare_batch(spec_file):
     return "\n".join(prepared_lines) + "\n", symbols
 
 
-def verify(result, description, parameters, comment=None):
+def verify(result, description, parameters, comment=None, designator_template=None, component_kind=None):
     """Compare Altium readback to the request, including the native Description."""
     metadata = result.get("metadata", {})
     actual = {name.casefold(): value for name, value in metadata.get("parameters", {}).items()}
@@ -187,6 +193,9 @@ def verify(result, description, parameters, comment=None):
         errors.append("native Description mismatch")
     if metadata.get("comment") != (parameters["MP"] if comment is None else comment):
         errors.append("Comment mismatch")
+    for key, expected in (("designator_template", designator_template), ("component_kind", component_kind)):
+        if expected is not None and metadata.get(key) != expected:
+            errors.append("native " + key + " mismatch")
     result["verification"] = {"passed": not errors, "errors": errors}
     if errors:
         result.update(success=False, error="created symbol metadata readback mismatch", may_have_partial_changes=True)
