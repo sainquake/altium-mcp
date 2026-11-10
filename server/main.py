@@ -52,6 +52,7 @@ import library_components_data
 import library_validation
 import library_roundtrip
 import footprint_editor
+import footprint_model3d
 import project_selection
 import lcsc_catalog
 from server_info import capture_runtime_info
@@ -175,7 +176,7 @@ MUTATING_COMMANDS = {
     "run_output_jobs", "create_pcb_footprint", "edit_schematic", "edit_schematic_actions",
     "set_library_component_data", "update_symbol_primitives", "remove_empty_library_component", "set_library_view", "verify_library_roundtrip", "create_document", "open_document", "save_document",
     "add_document_to_project", "open_project", "select_project", "close_document", "clone_schematic_components",
-    "set_footprint_pad_settings", "edit_footprint_primitives", "set_footprint_properties", "set_footprint_pad_properties",
+    "set_footprint_pad_settings", "edit_footprint_primitives", "set_footprint_properties", "set_footprint_pad_properties", "edit_footprint_model3d",
     "set_schematic_sheet_properties", "save_project", "edit_sheet_symbols", "draw_block_diagram",
 }
 
@@ -2078,6 +2079,37 @@ async def get_footprint_primitives(ctx: Context, library_path: str = "", footpri
     return json.dumps(result, indent=2)
 
 @_tool()
+async def edit_footprint_model3d(ctx: Context, library_path: str, footprint_name: str,
+                               body_index: Optional[int] = None, changes: Optional[Dict[str, Any]] = None,
+                               delete: bool = False, expected_model_file: Optional[str] = None,
+                               body_id: Optional[str] = None) -> str:
+    """Read/edit/replace/delete existing footprint 3D bodies in an exact PcbLib; never save.
+
+    Omit changes/delete to inventory live bodies in list order. body_index is
+    zero-based; an edit without either selector requires exactly one body. Optional
+    expected_model_file must match the inventory filename exactly before editing.
+    Prefer body_id=<body_address from inventory> to select a session body regardless
+    of iterator reordering. A stale ID fails; reread after switching/reopening.
+    Reuses dirty buffers. Coordinates are mm relative to the footprint origin.
+    changes accepts x_mm, y_mm, embed (boolean), model_path (existing absolute
+    .step/.stp), rotation_x/y/z (degrees) and z_mm. Omitted X/Y/embedding stay
+    unchanged. Rotation/Z updates require all four pose values together; replacing
+    a model also requires that complete pose. The script API cannot read these
+    out-parameters: partial pose edits are refused, and pose_applied acknowledges
+    dispatch rather than independent rotation/Z readback. Full pose requests
+    always run, even if identical. Position/embedding no-ops preserve Modified.
+    Linking needs an existing absolute model source; when an embedded model has
+    only a basename, supply model_path and the complete pose. embed defaults to
+    the old value on replacement. delete=True is exclusive with changes and
+    removes just the selected body; update/replace supports generic STEP bodies.
+    Native before/after snapshots verify X/Y, filename, embedding and unrelated
+    geometry. Inspect outcome_unknown/may_have_partial_changes before retrying.
+    """
+    return await footprint_model3d.execute(altium_bridge, EXCHANGE_DIR, library_path, footprint_name,
+                                           body_index, changes, delete, expected_model_file, body_id)
+
+
+@_tool()
 async def set_footprint_properties(ctx: Context, library_path: str, footprint_name: str,
                                    height_mm: Optional[float] = None) -> str:
     """Read/set native Height of one existing footprint in an exact .PcbLib; never save.
@@ -2167,7 +2199,7 @@ async def get_pcb_api_constants(ctx: Context, names: list[str]) -> str:
 
 
 @_tool()
-async def create_footprints_batch(ctx: Context, spec_file: str) -> str:
+async def create_footprints_batch(ctx: Context, spec_file: str, units: str = "mil") -> str:
     """
     Create many PCB footprints in a single Altium script run.
 
@@ -2180,19 +2212,27 @@ async def create_footprints_batch(ctx: Context, spec_file: str) -> str:
     field conventions.
 
     Args:
+        units (str): 'mil' (legacy default) or 'mm', case-insensitive. Applies
+            to ALL linear fields: coordinates, sizes, holes/stacks, mask/paste
+            expansions, text dimensions, Height and MODEL3D x/y/z offsets.
+            Angles, percentages, enum integers and booleans are unchanged.
+            Read getters still return their documented mil/mm units.
         spec_file (str): Path to a plain-text spec file, one record per line
-            (coords in mils, layers as names, shapes/hole types as raw
+            (linear dimensions in units, layers as names, shapes/hole types as raw
             Altium enum ints, booleans as 1/0):
             FPLIB|<path to .PcbLib>   (optional first line: opens/focuses)
-            FOOTPRINT|<name>|<description>
+            FOOTPRINT|<name>|<description>[|height]
+                Native Height, 0..1000 mm equivalent; omitted/blank defaults 0.
             EDITFOOTPRINT|<name>      add MODEL3D records to an existing
                                       footprint (never creates one; other
                                       records under it are reported and
                                       ignored)
-            PAD|name|x|y|rot|layer|plated|hole_size|hole_type|hole_width|hole_rot|top_x|top_y|top_shape[|corner_pct[|mode|mid_x|mid_y|mid_shape|bot_x|bot_y|bot_shape[|paste_mode|paste_expansion|mask_mode|mask_expansion]]]
+            PAD|name|x|y|rot|layer|plated|hole_size|hole_type|hole_width|hole_rot|top_x|top_y|top_shape[|corner_pct[|mode|mid_x|mid_y|mid_shape|bot_x|bot_y|bot_shape[|paste_mode|paste_expansion|mask_mode|mask_expansion[|testpoint_top|testpoint_bottom]]]]
+                Testpoint flags: 1/0, omitted/blank False. Top=True requires
+                Top Layer/Multi-Layer; Bottom=True requires Bottom/Multi-Layer.
                 Leave a field empty to skip it and still give a later one.
                 paste_mode/mask_mode are TMaskExpansionMode ints: 1 rule,
-                2 manual (with the expansion in mils). 0 (no mask) cannot
+                2 manual (with the expansion in units). 0 (no mask) cannot
                 be set on a pad by script and is reported as a problem.
                 Omitted: rule. Every pad the tool creates is locked.
             TRACK|x1|y1|x2|y2|width|layer
@@ -2200,10 +2240,11 @@ async def create_footprints_batch(ctx: Context, spec_file: str) -> str:
             FILL|x1|y1|x2|y2|rotation|layer
             TEXT|x|y|size|width|rotation|layer|mirror|ttf|text
             REGION|layer|kind|x1|y1|x2|y2|...
+            VIA|x|y|size|hole_size|low_layer|high_layer
             MODEL3D|<STEP file>|<layer>|<rot_x>|<rot_y>|<rot_z>|<z_offset>[|<x>|<y>[|<embed 1/0>]]
                 add a 3D body from a STEP file: rotations in degrees,
                 z_offset (model height above the board) and x|y (offset
-                from the footprint origin) in mils, embedded in the
+                from the footprint origin) in units, embedded in the
                 library unless embed is 0. Read the result back with
                 get_footprint_primitives (bodies_3d); its rotations and
                 z offset appear only once the library is saved.
@@ -2222,9 +2263,10 @@ async def create_footprints_batch(ctx: Context, spec_file: str) -> str:
     logger.info(f"Creating footprints batch from {spec_file}")
 
     try:
-        prepared_spec = footprint_editor.prepare_batch_file(spec_file, EXCHANGE_DIR)
+        prepared_spec = footprint_editor.prepare_batch_file(spec_file, EXCHANGE_DIR, units)
+        expected = footprint_editor.batch_expectations(prepared_spec)
     except (ValueError, TypeError, OSError) as exc:
-        return json.dumps({"success": False, "error": str(exc), "may_have_partial_changes": False})
+        return json.dumps({"success": False, "error": str(exc), "saved": False, "may_have_partial_changes": False})
     try:
         response = await altium_bridge.execute_command(
             "create_footprints_batch", {"spec_file": str(prepared_spec)})
@@ -2233,6 +2275,10 @@ async def create_footprints_batch(ctx: Context, spec_file: str) -> str:
     # Keep the request if completion is unknown; it may still be in use.
     if "result" in response:
         prepared_spec.unlink(missing_ok=True)
+
+    if response.get("command_started") is False:
+        prepared_spec.unlink(missing_ok=True)
+        return json.dumps({"success": False, "error": response.get("error"), "saved": False, "may_have_partial_changes": False})
 
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
@@ -2243,7 +2289,16 @@ async def create_footprints_batch(ctx: Context, spec_file: str) -> str:
                            "spec_file": str(prepared_spec)})
 
     result = response.get("result", {})
-    return json.dumps(result, indent=2) if not isinstance(result, str) else result
+    if isinstance(result, str):
+        result = json.loads(result)
+    errors = footprint_editor.verify_batch(result, expected)
+    result["input_units"] = footprint_editor.batch_units(units)
+    result["verification"] = {"passed": not errors, "errors": errors}
+    result["success"] = not errors and not result.get("failed") and not result.get("problems") and not result.get("primitive_errors")
+    result["may_have_partial_changes"] = not result["success"] and bool(result.get("created") or result.get("edited"))
+    if errors:
+        result["error"] = "batch footprint property readback failed"
+    return json.dumps(result, indent=2)
 
 @_tool()
 async def build_schematic(ctx: Context, parts: list, wires: list = None,

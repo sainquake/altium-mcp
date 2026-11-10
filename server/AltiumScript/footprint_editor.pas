@@ -452,8 +452,8 @@ end;
 // Validate every layer before creating any object, even in a later footprint.
 function ValidateFootprintBatchLayers(Lines: TStringList): String;
 var
-    I, Field: Integer;
-    Kind, Name: String;
+    I, Field, Side, Layer: Integer;
+    Kind, Name, Flag: String;
 begin
     Result := '';
     for I := 0 to Lines.Count - 1 do
@@ -474,6 +474,23 @@ begin
             if Kind = 'VIA' then
                 if FootprintEditLayer(Trim(GetFieldFromPipeString(Lines[I], 6))) = eNoLayer then
                 begin Result := 'Unknown via end layer at line ' + IntToStr(I + 1); Exit; end;
+            if Kind='PAD' then
+            begin
+                Layer := FootprintEditLayer(Name);
+                for Side := 26 to 27 do
+                begin
+                    Flag := Trim(GetFieldFromPipeString(Lines[I],Side));
+                    if (Flag<>'') and (Flag<>'0') and (Flag<>'1') then
+                    begin Result := 'Testpoint flag must be 0, 1 or blank at line '+IntToStr(I+1); Exit; end;
+                    if Flag='1' then
+                    begin
+                        if (Side=26) and (Layer<>eTopLayer) and (Layer<>eMultiLayer) then
+                        begin Result := 'Top testpoint requires Top Layer or Multi-Layer at line '+IntToStr(I+1); Exit; end;
+                        if (Side=27) and (Layer<>eBottomLayer) and (Layer<>eMultiLayer) then
+                        begin Result := 'Bottom testpoint requires Bottom Layer or Multi-Layer at line '+IntToStr(I+1); Exit; end;
+                    end;
+                end;
+            end;
         end;
     end;
 end;

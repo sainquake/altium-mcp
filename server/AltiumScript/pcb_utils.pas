@@ -26,7 +26,7 @@ end;
 // text, pipe-delimited; coords in mils, layers as names, shapes/hole types
 // as raw enum ints - symmetric with get_footprint_primitives):
 //   FPLIB|<path to .PcbLib>              (optional first line - focus/open)
-//   FOOTPRINT|<name>|<description>
+//   FOOTPRINT|<name>|<description>[|height_mils]
 //   EDITFOOTPRINT|<name>                 add MODEL3D records to an existing
 //                                        footprint (never creates one)
 //   PAD|name|x|y|rot|layer|plated|hole_size|hole_type|hole_width|hole_rot|top_x|top_y|top_shape[|corner_pct[|mode|mid_x|mid_y|mid_shape|bot_x|bot_y|bot_shape[|paste_mode|paste_exp|mask_mode|mask_exp]]]
@@ -37,6 +37,32 @@ end;
 //   ARC|cx|cy|radius|start_angle|end_angle|width|layer
 //   FILL|x1|y1|x2|y2|rotation|layer
 //   TEXT|x|y|size|width|rotation|layer|mirror|ttf|text
+// PAD fields 26/27 are native Top/Bottom testpoint booleans, default False.
+// The Python preflight converts explicit input units to mils before dispatch.
+function FootprintBatchReadback(Path: String; Comp: IPCB_LibComponent): String;
+var Props,Pads,Item: TStringList; Iter: IPCB_GroupIterator; Prim: IPCB_Primitive; Pad: IPCB_Pad; Count: Integer;
+begin
+    Props := TStringList.Create; Pads := TStringList.Create; Item := TStringList.Create; Count := 0;
+    Iter := Comp.GroupIterator_Create;
+    try
+        AddJSONProperty(Props,'library_path',Path); AddJSONProperty(Props,'footprint_name',Comp.Name);
+        AddJSONNumber(Props,'height_mm',FootprintHeightMM(Comp));
+        Prim := Iter.FirstPCBObject;
+        while Prim<>nil do
+        begin
+            if Prim.ObjectId=ePadObject then
+            begin
+                Pad := Prim; Item.Clear; AddJSONProperty(Item,'name',Pad.Name);
+                AddJSONBoolean(Item,'is_testpoint_top',Pad.IsTestpoint_Top);
+                AddJSONBoolean(Item,'is_testpoint_bottom',Pad.IsTestpoint_Bottom);
+                Pads.Add(BuildJSONObject(Item)); Count := Count+1;
+            end;
+            Prim := Iter.NextPCBObject;
+        end;
+        AddJSONInteger(Props,'pad_count',Count); Props.Add('"pads":'+BuildJSONArray(Pads)); Result := BuildJSONObject(Props);
+    finally Comp.GroupIterator_Destroy(Iter); Props.Free; Pads.Free; Item.Free; end;
+end;
+
 function CreateFootprintsBatch(SpecFilePath: String): String;
 var
     PcbLib      : IPCB_Library;
@@ -69,7 +95,9 @@ var
     Matched     : Boolean;
     Shown       : Boolean;
     Problems    : TStringList;
+    Readbacks   : TStringList;
     LayerError  : String;
+    NeedReadback: Boolean;
 
 
 begin
@@ -83,6 +111,8 @@ begin
     FailedArray := TStringList.Create;
     ResultProps := TStringList.Create;
     Problems := TStringList.Create;
+    Readbacks := TStringList.Create;
+    NeedReadback := False;
     LibComp := nil;
     PcbLib := nil;
     CurMode := '';
@@ -120,6 +150,11 @@ begin
             Kind := UpperCase(Trim(GetFieldFromPipeString(Line, 0)));
 
             try
+                if (Kind='FPLIB') or (Kind='FOOTPRINT') or (Kind='EDITFOOTPRINT') then
+                    if NeedReadback and (LibComp<>nil) and (PcbLib<>nil) then
+                    begin
+                        Readbacks.Add(FootprintBatchReadback(PcbLib.Board.FileName,LibComp)); NeedReadback := False;
+                    end;
                 if (Kind = 'FPLIB') then
                 begin
                     // Stop unless that library is now the focused one -
@@ -190,9 +225,13 @@ begin
                         LibComp := PCBServer.CreatePCBLibComp;
                         LibComp.Name := Trim(GetFieldFromPipeString(Line, 1));
                         LibComp.Description := GetFieldFromPipeString(Line, 2);
+                        FieldValue := Trim(GetFieldFromPipeString(Line, 3));
+                        LibComp.Height := 0;
+                        if FieldValue<>'' then LibComp.Height := MilsToCoord(SafeStrToFloat(FieldValue));
                         PcbLib.RegisterComponent(LibComp);
                         PCBServer.SendMessageToRobots(PcbLib.Board.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, LibComp.I_ObjectAddress);
                         CreatedCount := CreatedCount + 1;
+                        NeedReadback := True;
                     end;
                 end
                 else if (LibComp <> nil) and (Kind = 'MODEL3D') then
@@ -280,6 +319,8 @@ begin
                                                       Trim(GetFieldFromPipeString(Line, 24)), Trim(GetFieldFromPipeString(Line, 25)));
                     if (FieldValue <> '') then
                         Problems.Add('"' + JSONEscapeString(LibComp.Name + ' pad ' + Pad.Name + ': ' + FieldValue) + '"');
+                    Pad.IsTestpoint_Top := Trim(GetFieldFromPipeString(Line,26))='1';
+                    Pad.IsTestpoint_Bottom := Trim(GetFieldFromPipeString(Line,27))='1';
                     // Rotation last: it rotates the pad about its location
                     Pad.Rotation := SafeStrToFloat(Trim(GetFieldFromPipeString(Line, 4)));
                     // Every pad the tool creates is locked
@@ -372,6 +413,7 @@ begin
                 end;
             except
                 PrimErrors := PrimErrors + 1;
+                Problems.Add('"'+JSONEscapeString('line '+IntToStr(i+1)+' '+Kind+': '+ExceptionMessage)+'"');
                 if (Kind = 'FOOTPRINT') then
                     FailedArray.Add('"' + JSONEscapeString(Trim(GetFieldFromPipeString(Line, 1))) + '"');
             end;
@@ -385,7 +427,14 @@ begin
         end;
         if (CreatedCount + EditedCount > 0) and (PcbLib <> nil) then
             MarkDocumentModified(PcbLib.Board.FileName);
+        if NeedReadback and (LibComp<>nil) and (PcbLib<>nil) then
+            Readbacks.Add(FootprintBatchReadback(PcbLib.Board.FileName,LibComp));
 
+        AddJSONBoolean(ResultProps,'success',(PrimErrors=0) and (FailedArray.Count=0) and (Problems.Count=0));
+        AddJSONBoolean(ResultProps,'saved',False);
+        AddJSONBoolean(ResultProps,'may_have_partial_changes',((CreatedCount+EditedCount)>0) and
+            ((PrimErrors>0) or (FailedArray.Count>0) or (Problems.Count>0)));
+        ResultProps.Add('"footprints":'+BuildJSONArray(Readbacks));
         AddJSONInteger(ResultProps, 'created', CreatedCount);
         AddJSONInteger(ResultProps, 'edited', EditedCount);
         AddJSONInteger(ResultProps, 'models_added', ModelCount);
@@ -405,6 +454,7 @@ begin
         FailedArray.Free;
         ResultProps.Free;
         Problems.Free;
+        Readbacks.Free;
     end;
 end;
 

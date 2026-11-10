@@ -1,5 +1,8 @@
 # Library script replacements
 
+For existing STEP body position, pose, embedding, replacement and deletion, see
+[`edit_footprint_model3d`](FOOTPRINT_MODEL3D.md). Batch creation still adds bodies.
+
 Analysis of the supplied `1-operation_report.md` (TPS3808G01DBVR, 2026-11-03).
 The report describes historical results. Subsequent live validation and fixes are
 recorded in [FOOTPRINT_EDITOR_LIVE_TEST.md](FOOTPRINT_EDITOR_LIVE_TEST.md).
@@ -95,6 +98,9 @@ change geometry or edit pads. Mechanical layers 1..16 are supported, including
 accepted only as the current selector layer, never as a destination.
 
 ## Creation validation and readback
+
+Batch creation now accepts explicit mm/mil input, native Height and new-pad
+testpoint flags. See [creation schema and verification](FOOTPRINT_CREATION.md).
 
 `create_footprints_batch` normalizes mechanical aliases in a private spec copy;
 it does not rewrite the caller's file. Altium preflights all layer-bearing records

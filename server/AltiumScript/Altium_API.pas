@@ -1285,7 +1285,7 @@ begin
     else if (CommandName <> 'edit_schematic') and (CommandName <> 'get_schematic_connectivity') and
        (CommandName <> 'set_library_component_data') and (CommandName <> 'get_library_components_data') and (CommandName <> 'update_symbol_primitives') and (CommandName <> 'remove_empty_library_component') and (CommandName <> 'set_library_view') and (CommandName <> 'verify_library_roundtrip') and (CommandName <> 'clone_schematic_components') and
        (CommandName <> 'set_footprint_pad_settings') and (CommandName <> 'edit_footprint_primitives') and
-       (CommandName <> 'get_pcb_api_constants') and (CommandName <> 'set_footprint_properties') and (CommandName <> 'set_footprint_pad_properties') and
+       (CommandName <> 'get_pcb_api_constants') and (CommandName <> 'set_footprint_properties') and (CommandName <> 'set_footprint_pad_properties') and (CommandName <> 'edit_footprint_model3d') and
        (CommandName <> 'set_schematic_sheet_properties') and (CommandName <> 'zoom_schematic') and
        (CommandName <> 'edit_sheet_symbols') and (CommandName <> 'draw_block_diagram') and
        (CommandName <> 'save_project') and
@@ -1381,6 +1381,8 @@ begin
             Result := ExecuteCloseDocument(RequestData);
         'clone_schematic_components':
             Result := ExecuteCloneSchematicComponents(RequestData);
+        'edit_footprint_model3d':
+            Result := ExecuteFootprintModel3D(RequestData);
         'set_footprint_pad_settings', 'edit_footprint_primitives', 'get_pcb_api_constants', 'set_footprint_properties', 'set_footprint_pad_properties':
             Result := ExecuteFootprintLibraryCommand(CommandName, RequestData);
         'set_schematic_sheet_properties', 'zoom_schematic', 'save_project':
@@ -1652,7 +1654,7 @@ begin
                    (CommandType <> 'open_document') and (CommandType <> 'close_document') and
                    (CommandType <> 'clone_schematic_components') and (CommandType <> 'get_library_components_data') and (CommandType <> 'update_symbol_primitives') and (CommandType <> 'remove_empty_library_component') and (CommandType <> 'set_library_view') and (CommandType <> 'verify_library_roundtrip') and
                    (CommandType <> 'set_footprint_pad_settings') and (CommandType <> 'edit_footprint_primitives') and
-                   (CommandType <> 'get_pcb_api_constants') and (CommandType <> 'set_footprint_properties') and (CommandType <> 'set_footprint_pad_properties') and
+                   (CommandType <> 'get_pcb_api_constants') and (CommandType <> 'set_footprint_properties') and (CommandType <> 'set_footprint_pad_properties') and (CommandType <> 'edit_footprint_model3d') and
                    (CommandType <> 'set_schematic_sheet_properties') and (CommandType <> 'zoom_schematic') and
                    (CommandType <> 'edit_sheet_symbols') and (CommandType <> 'draw_block_diagram') and
                    (CommandType <> 'save_project') then EnsureDesignProjectFocused();

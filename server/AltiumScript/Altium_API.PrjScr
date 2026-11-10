@@ -1199,3 +1199,6 @@ DocumentPath=library_components_data.pas
 
 [Document20]
 DocumentPath=library_roundtrip.pas
+
+[Document21]
+DocumentPath=footprint_model3d.pas

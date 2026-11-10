@@ -5,6 +5,7 @@ import math
 from pathlib import Path, PureWindowsPath
 import re
 import uuid
+from collections import Counter
 
 from altium_files import read_altium_text, write_altium_text
 from library_component_data import library_path, text
@@ -278,8 +279,23 @@ async def execute(bridge, exchange_dir, command, prepare, *args, **kwargs):
             spec_path.unlink(missing_ok=True)
 
 
-def prepare_batch_file(spec_file, exchange_dir):
-    """Normalize mechanical aliases in a private copy, preserving the caller's file."""
+BATCH_LINEAR_FIELDS = {
+    "PAD": (2, 3, 7, 9, 11, 12, 16, 17, 19, 20, 23, 25),
+    "TRACK": (1, 2, 3, 4, 5), "ARC": (1, 2, 3, 6), "FILL": (1, 2, 3, 4),
+    "TEXT": (1, 2, 3, 4), "MODEL3D": (6, 7, 8), "VIA": (1, 2, 3, 4),
+    "FOOTPRINT": (3,),
+}
+
+
+def batch_units(units):
+    if not isinstance(units, str) or units.casefold() not in {"mm", "mil"}:
+        raise ValueError("units must be mm or mil")
+    return units.casefold()
+
+
+def prepare_batch_file(spec_file, exchange_dir, units="mil"):
+    """Preflight creation properties/units and normalize a private mil-valued copy."""
+    units = batch_units(units)
     source = Path(spec_file)
     if not source.is_file():
         raise ValueError("spec_file must be an existing file")
@@ -289,13 +305,97 @@ def prepare_batch_file(spec_file, exchange_dir):
     for index, line in enumerate(lines):
         fields = line.split("|")
         kind = fields[0].strip().upper()
+        if kind == "FOOTPRINT":
+            if not 2 <= len(fields) <= 4 or not fields[1].strip():
+                raise ValueError(f"line {index + 1}: expected FOOTPRINT|name|description[|height]")
+        elif kind == "EDITFOOTPRINT" and (len(fields) != 2 or not fields[1].strip()):
+            raise ValueError(f"line {index + 1}: expected EDITFOOTPRINT|name; Height is creation-only")
+        elif kind == "PAD" and len(fields) > 28:
+            raise ValueError(f"line {index + 1}: unexpected PAD fields after testpoint_bottom")
+        elif units == "mm" and kind and kind not in {*fields_by_kind, "FPLIB", "FOOTPRINT", "EDITFOOTPRINT"}:
+            raise ValueError(f"line {index + 1}: unknown record cannot be converted from mm: {kind}")
         if kind == "FPLIB" and len(fields) > 1:
             fields[1] = library_path(fields[1].strip(), ".pcblib")
         for position in fields_by_kind.get(kind, ()):
             if position >= len(fields):
                 raise ValueError(f"line {index + 1}: missing layer")
             fields[position] = layer_name(fields[position], legacy_only=False)
+            alias = re.sub(r"[\s-]", "", fields[position].casefold())
+            canonical = {"toplayer": "Top Layer", "etoplayer": "Top Layer",
+                         "bottomlayer": "Bottom Layer", "ebottomlayer": "Bottom Layer",
+                         "multilayer": "Multi-Layer", "emultilayer": "Multi-Layer"}
+            fields[position] = canonical.get(alias, fields[position])
+        positions = range(3, len(fields)) if kind == "REGION" else BATCH_LINEAR_FIELDS.get(kind, ())
+        for position in positions:
+            if position >= len(fields) or not fields[position].strip():
+                continue
+            try:
+                value = float(fields[position])
+                converted = value / .0254 if units == "mm" else value
+                number(converted, "linear value")
+            except (ValueError, TypeError, OverflowError) as exc:
+                raise ValueError(f"line {index + 1}: invalid linear value at field {position}: {fields[position]}") from exc
+            if kind == "FOOTPRINT" and not 0 <= converted * .0254 <= 1000 + 1e-9:
+                raise ValueError(f"line {index + 1}: Height must be within 0..1000 mm")
+            if units == "mm":
+                fields[position] = number(converted, "converted mil value")
+        if kind == "PAD":
+            for position, allowed in ((26, {"Top Layer", "Multi-Layer"}), (27, {"Bottom Layer", "Multi-Layer"})):
+                flag = fields[position].strip() if position < len(fields) else ""
+                if flag not in {"", "0", "1"}:
+                    raise ValueError(f"line {index + 1}: testpoint flags must be 0, 1 or blank")
+                if flag == "1" and fields[5] not in allowed:
+                    raise ValueError(f"line {index + 1}: testpoint side is incompatible with {fields[5]}")
         lines[index] = "|".join(fields)
     destination = exchange_dir / f"footprint_batch_{uuid.uuid4().hex}.txt"
     write_altium_text(destination, "\n".join(lines) + "\n")
     return destination
+
+
+def batch_expectations(prepared_file):
+    """Creation-only expected properties, including repeated physical pad names."""
+    rows=[];current=None;library=None
+    for line in read_altium_text(prepared_file).splitlines():
+        fields=line.split("|");kind=fields[0].strip().upper()
+        if kind == "FPLIB":
+            library=fields[1].strip();current=None
+        elif kind == "FOOTPRINT":
+            current=dict(library_path=library,footprint_name=fields[1].strip(),
+                         height_mm=float(fields[3])*.0254 if len(fields)>3 and fields[3].strip() else 0,pads=[])
+            rows.append(current)
+        elif kind == "EDITFOOTPRINT":
+            current=None
+        elif kind == "PAD" and current is not None:
+            current["pads"].append(dict(name=fields[1],is_testpoint_top=len(fields)>26 and fields[26].strip()=="1",
+                                        is_testpoint_bottom=len(fields)>27 and fields[27].strip()=="1"))
+    return rows
+
+
+def verify_batch(result, expected):
+    errors=[];actual=result.get("footprints")
+    if not isinstance(actual,list) or len(actual)!=len(expected) or type(result.get("created")) is not int or result.get("created")!=len(expected):
+        return ["created footprint readback count mismatch"]
+    if result.get("success") is False:
+        errors.append("native batch reported failure")
+    if result.get("saved") is not False:
+        errors.append("batch creation must not save")
+    for row,wanted in zip(actual,expected):
+        if (not isinstance(row,dict) or row.get("footprint_name")!=wanted["footprint_name"] or
+                (wanted["library_path"] and (not isinstance(row.get("library_path"),str) or PureWindowsPath(row["library_path"])!=PureWindowsPath(wanted["library_path"])) )):
+            errors.append("created footprint identity/order mismatch")
+            continue
+        height=row.get("height_mm")
+        if type(height) not in (int,float) or not math.isfinite(height) or abs(height-wanted["height_mm"])>.000003:
+            errors.append("native Height readback mismatch: "+wanted["footprint_name"])
+        pads=row.get("pads")
+        if not isinstance(pads,list) or type(row.get("pad_count")) is not int or row.get("pad_count")!=len(wanted["pads"]) or len(pads)!=len(wanted["pads"]):
+            errors.append("created pad count mismatch: "+wanted["footprint_name"])
+            continue
+        if any(not isinstance(p,dict) or not isinstance(p.get("name"),str) or
+               any(type(p.get(k)) is not bool for k in ("is_testpoint_top","is_testpoint_bottom")) for p in pads):
+            errors.append("missing native pad name/testpoint flags")
+            continue
+        key=lambda p:(p["name"],p["is_testpoint_top"],p["is_testpoint_bottom"])
+        if Counter(map(key,pads))!=Counter(map(key,wanted["pads"])):
+            errors.append("native testpoint flag readback mismatch: "+wanted["footprint_name"])
+    return errors
