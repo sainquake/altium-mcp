@@ -2679,21 +2679,40 @@ async def get_schematic_connectivity(ctx: Context, sheet_path: str, compiled: bo
 
 
 @_tool(read_only=True)
-async def get_lcsc_component_info(ctx: Context, query: str, qty: int = 1, limit: int = 5) -> str:
-    """Read LCSC chip/component data by C-number, MPN or search text; no Altium needed.
+async def get_lcsc_component_info(ctx: Context, query: str = "", qty: int = 1, limit: int = 5,
+                                 manufacturer: str = "", exact_mpn: str = "", include_historical: bool = True,
+                                 historical_url: str = "", queries: Optional[list] = None) -> str:
+    """Read single/batch LCSC cards by C-number, exact orderable MPN or text; no Altium.
 
-    Returns detail cards: identity, manufacturer, category, description, package,
-    all catalog technical parameters with original names/units, datasheet/product
-    links, stock, MOQ, USD price breaks and quantity pricing. Exact MPN matches
-    are preferred when present; ambiguous candidates remain explicit results.
-    qty is positive; limit is 1..10. No ranking, alternatives, jobs or disk cache.
-    Each card includes lcsc_parameters ready to merge into symbol creation.
-    Unknown stock/MOQ/prices remain null (empty strings in library fields).
-    Uses the source toolkit's undocumented public-web endpoints; schema/network
-    errors are reported without guessed data. Stock/prices are timestamped snapshots.
+    Existing query/qty/limit calls remain valid. manufacturer is an exact brand
+    filter (case/spacing and a small documented alias set normalized); exact_mpn
+    is a complete order code string, preserving commas, slashes and suffixes.
+    Both are checked on detail cards, not only search summaries. orderable_mpn
+    is the catalog's full MPN, never an inferred suffix. limit=1..10 applies after
+    filtering; text searches scan at most three 30-row pages. qty is positive.
+    queries replaces query: 1..25 strings or objects with query, id and any lookup
+    option. All entries are preflighted; three workers, identical requests fetched
+    once, results in input order with individual errors/partial_success.
+    include_historical falls back to bounded public LCSC/CN page discovery when
+    no verified current card exists. Optional historical_url is an HTTPS LCSC or
+    item.szlcsc.com product-card hint. Historical pages never supply a fresh USD
+    quote; stock/MOQ/prices stay null. Source URLs and unavailable/blocked sources
+    are explicit in historical_search; empty incomplete results are failures.
+    sales_status is on_sale/not_for_sale/discontinued/unknown with source evidence
+    and region. It is separate from stock and manufacturer lifecycle. Cards retain
+    technical parameters/units, datasheets, quantity pricing and lcsc_parameters.
+    Read-only HTTP only: no Altium changes, saves, persistent cache or purchases.
     """
     try:
-        result = await asyncio.to_thread(lcsc_catalog.LcscClient().lookup, query, qty, limit)
+        client = lcsc_catalog.LcscClient()
+        if queries is not None:
+            if query:
+                raise ValueError("use query or queries, not both")
+            result = await asyncio.to_thread(client.lookup_many, queries, qty, limit, manufacturer,
+                                             exact_mpn, include_historical, historical_url)
+        else:
+            result = await asyncio.to_thread(client.lookup, query, qty, limit, manufacturer,
+                                             exact_mpn, include_historical, historical_url)
         return json.dumps(result, indent=2, ensure_ascii=False)
     except (ValueError, TypeError, lcsc_catalog.LcscError) as exc:
         return json.dumps({"success": False, "error": str(exc), "saved": False}, ensure_ascii=False)

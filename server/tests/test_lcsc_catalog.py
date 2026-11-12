@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from typing import Optional
 from unittest.mock import AsyncMock, patch
 from urllib import error
 
@@ -85,7 +86,7 @@ class CatalogTest(unittest.TestCase):
             self.assertEqual(client.lookup("c136648")["result_count"], 1)
             self.assertEqual(request.call_count, 1)
         with patch.object(client, "_request_result", return_value={"dataList": []}):
-            self.assertEqual(client.lookup("no-such-part")["components"], [])
+            self.assertEqual(client.lookup("no-such-part", include_historical=False)["components"], [])
         row = {"productCode": "C136648", "productModel": "LMR16030SDDAR"}
         with patch.object(client, "_request_result", side_effect=[{"dataList": [row, row]}, payload()]) as request:
             self.assertEqual(client.lookup("regulator")["result_count"], 1)
@@ -125,7 +126,7 @@ class CatalogTest(unittest.TestCase):
         transient = error.HTTPError(data.BASE_URL, 503, "Unavailable", None, None)
         response = io.BytesIO(b'{"code":200,"result":{"dataList":[]}}')
         with patch.object(data.request, "urlopen", side_effect=[transient, response]) as request, patch.object(data.time, "sleep"):
-            self.assertTrue(data.LcscClient().lookup("LMR16030")["success"])
+            self.assertTrue(data.LcscClient().lookup("LMR16030", include_historical=False)["success"])
             self.assertEqual(request.call_count, 2)
             sent = request.call_args.args[0]
             self.assertEqual(sent.get_method(), "POST")
@@ -149,7 +150,7 @@ class CatalogToolsTest(unittest.TestCase):
         tree = ast.parse((Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8"))
         function = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == name)
         function.decorator_list = []
-        scope = {"Context": object, "json": json, "asyncio": asyncio, "lcsc_catalog": data,
+        scope = {"Context": object, "json": json, "asyncio": asyncio, "lcsc_catalog": data, "Optional": Optional,
                  "library_component_data": library_component_data, "set_library_component_data": self.metadata_tool}
         exec(compile(ast.Module(body=[function], type_ignores=[]), name, "exec"), scope)
         return scope[name]
