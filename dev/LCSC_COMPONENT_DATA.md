@@ -119,8 +119,8 @@ Sale status is separate from stock: zero stock does not mean discontinued.
 `isForeignOnsale=false` means not for sale in the international catalog, not
 manufacturer end-of-life. Unrecognized/missing flags remain unknown. An explicit
 sale-stop label on the domestic card is reported as discontinued in region `CN`.
-The additional lookup fields are not automatically added to the existing
-15-field `lcsc_parameters` dictionary or to the symbol writer.
+The `lcsc_parameters` dictionary includes supplier provenance, UTC retrieval time
+and regional sale status, using the same fields as the symbol writer below.
 
 A completed bounded search with no candidates returns `success=true`,
 `result_count=0` and an empty `components` list. Missing exact codes or empty
@@ -163,13 +163,31 @@ challenges returned with HTTP 200; the client does not attempt to solve them.
 
 `set_library_component_lcsc_data` accepts an exact C-number, not an implicit
 result index. It fetches a fresh detail card, reads the exact symbol and requires
-one nonempty MP matching the card's MPN case-insensitively. A missing/ambiguous MP,
-mismatch or failed lookup returns without writing fields.
+one nonempty `MP` and one nonempty `MF` matching the card's complete MPN and
+manufacturer. MPN comparison preserves punctuation and order suffixes and ignores
+only case/surrounding whitespace. Manufacturer comparison uses the same complete
+brand normalization and documented aliases as lookup. A missing, ambiguous or
+mismatched identity fails before writes; matching MPN alone is insufficient.
+
+The symbol's `Package` is compared with the catalog package after case/whitespace
+normalization. A known mismatch blocks by default and reports both original
+values. `allow_package_mismatch=True` permits this naming conflict only and
+returns an explicit warning. It cannot bypass MP/MF checks or duplicate Package
+parameters. Missing package data produces `package_unverified`; it is not treated
+as verified compatibility. No package synonyms, footprint geometry or land-pattern
+compatibility are inferred. The existing core Package and model bindings stay
+unchanged, including on override.
+
+Identity/package refusals return `identity_check`, `package_check`, `conflicts` and
+`may_have_partial_changes=false`. Successful preflight returns `identity_verified`
+for MP/MF, `package_conflict`, `package_mismatch_allowed` and `warnings` alongside
+the write result. This is a separate read/write operation: do not concurrently
+edit the symbol between its preflight and application.
 
 The library path follows `set_library_component_data`: an absolute path to an
 existing SchLib. A newly created symbol may still be unsaved in that library.
 
-The operation upserts only these 15 string fields:
+The operation upserts 22 supplier-owned string fields. The original 15 are:
 
 | Identity and documentation | Procurement snapshot |
 | --- | --- |
@@ -182,11 +200,26 @@ The operation upserts only these 15 string fields:
 | `LCSC Package` | `LCSC Currency` |
 | `LCSC Datasheet URL` | |
 
+Seven provenance/status fields are also written:
+
+| Field | Meaning |
+|---|---|
+| `LCSC Source URL` | Actual API/page URL used to obtain the card |
+| `LCSC Data Source` | Source type, such as `lcsc_detail_api` |
+| `LCSC Fetched At` | UTC ISO 8601 retrieval timestamp |
+| `LCSC Sales Status` | `on_sale`, `not_for_sale`, `discontinued` or `unknown` |
+| `LCSC Sales Region` | Market to which the sale status applies |
+| `LCSC Sales Status Evidence` | Compact JSON of the raw flags or page status |
+| `LCSC Lifecycle Raw` | Uninterpreted catalog lifecycle field, empty if absent |
+
 `JLCPCB Part#` follows the existing project's convention of storing the LCSC
 C-number; this does not check JLCPCB assembly inventory or Basic/Extended class.
 Unknown values become empty strings, clearing stale supplier data instead of
-retaining an old price or stock value. No retrieval timestamp is written as a
-parameter, so equivalent repeated data can return `changed=false`.
+retaining an old price or stock value. Unknown sale status is written explicitly
+as `unknown`; an empty evidence object is `{}`. Sale status is not inferred from
+stock. Refreshing records the new retrieval timestamp even when other values are
+equal, so another live fetch normally returns `changed=true`. Identical complete
+snapshots still reuse parameter names and remain idempotent in the native writer.
 
 Core fields (`Value`, `MF`, `MP`, `HelpURL`, `Package`, `Type`, `Instructions`,
 `System`), Comment, native Description, unrelated parameters, models and geometry
@@ -195,7 +228,7 @@ score, search mode and applied-result index are deliberately not transferred.
 
 The result retains the native writer's before/after snapshots, `changed`,
 `saved=false`, Modified state and readback verification, plus `lcsc_id`,
-`lcsc_fetched_at` and `lcsc_parameter_names`. Changed metadata must leave the
+`lcsc_fetched_at`, `lcsc_parameter_names` and the preflight report. Changed metadata must leave the
 library marked Modified. A native/API failure can leave partial in-memory edits;
 inspect `may_have_partial_changes` before retrying. Do not edit the same symbol
 concurrently between its read and write.
@@ -217,6 +250,7 @@ python -m unittest server.tests.test_lcsc_catalog server.tests.test_library_comp
 python -m unittest server.tests.test_lcsc_lookup -v
 python dev/test_lcsc_lookup_live.py
 python dev/test_lcsc_catalog_live.py --schlib 'C:\Project\Symbols.SchLib' --lcsc-id C136648
+python dev/test_lcsc_application_live.py --exercise --schlib 'C:\Project\Symbols.SchLib'
 ```
 
 The live harness fetches a real part, creates symbols only in an unsaved library
@@ -233,3 +267,9 @@ holds stale buffers. No user configuration or dependency installation is needed.
 For the batch/filter/status/recovery extension, see the separate
 [2026-11-11 validation record](LCSC_LOOKUP_LIVE_TEST.md). Catalog-only checks do
 not require Altium or any library write.
+
+The strict application harness creates only disposable fixture symbols, tests
+manufacturer/MPN/package refusals and an explicit package override, verifies
+provenance/core fields/geometry, then closes the copy with discard. It stops
+dispatching after unknown completion. See
+[strict application validation](LCSC_APPLICATION_LIVE_TEST.md).

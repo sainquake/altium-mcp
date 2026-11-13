@@ -54,3 +54,15 @@ hardcoded into the runtime client.
 
 Restart/reconnect the existing MCP connection to load the expanded Python
 signature. No new dependency, API key or Altium script is required.
+
+## Revalidation on 2026-11-12
+
+All 30 catalog-specific tests passed again. The six live scenarios also passed
+their assertions in `.altium-mcp/lcsc_lookup_20261112_094009/report.json`, including
+the explicit unavailable-source outcome for E04. The harness dispatched zero
+Altium commands and saved no documents. No implementation changes were needed.
+
+The connected MCP process still reported startup on 2026-11-10 and exposed only
+the old `query`/`qty`/`limit` signature. The expanded handler was exercised through
+a fresh production import; activating it in that connection requires restarting
+or reconnecting the MCP process. Starting a second listener was not attempted.

@@ -142,7 +142,7 @@ class CatalogToolsTest(unittest.TestCase):
         self.library = Path(self.temp.name) / "Parts.SchLib"
         self.library.touch()
         self.component = data.component_from_payload(payload(), 100)
-        self.snapshot = {"parameters": {"MP": self.component["mpn"], "MF": "Manual manufacturer", "Value": "Regulator"},
+        self.snapshot = {"parameters": {"MP": self.component["mpn"], "MF": "Texas Instruments", "Package": "SO-8-EP", "Value": "Regulator"},
                          "description": "Manual native component description", "comment": "Manual comment", "models": []}
         self.metadata_tool = AsyncMock(return_value=json.dumps({"success": True, "after": self.snapshot, "saved": False}))
 
@@ -155,8 +155,8 @@ class CatalogToolsTest(unittest.TestCase):
         exec(compile(ast.Module(body=[function], type_ignores=[]), name, "exec"), scope)
         return scope[name]
 
-    def apply(self, code="C136648"):
-        return json.loads(asyncio.run(self.tool("set_library_component_lcsc_data")(None, str(self.library), "TEST", code, 100)))
+    def apply(self, code="C136648", **options):
+        return json.loads(asyncio.run(self.tool("set_library_component_lcsc_data")(None, str(self.library), "TEST", code, 100, **options)))
 
     def test_info_has_no_altium_dependency_and_reports_network_failure(self):
         tool = self.tool("get_lcsc_component_info")
@@ -192,6 +192,79 @@ class CatalogToolsTest(unittest.TestCase):
             self.assertFalse(result["success"])
             self.assertFalse(result["may_have_partial_changes"])
             self.assertEqual(self.metadata_tool.await_count, 1)
+
+    def test_same_mpn_wrong_missing_or_ambiguous_manufacturer_never_writes(self):
+        for mf in ({"MF":"Tokmas"}, {}, {"MF":""}, {"MF":"unknown"}, {"MF":"TI","mf":"TI"}):
+            parameters = {k:v for k,v in self.snapshot['parameters'].items() if k!='MF'} | mf
+            self.metadata_tool.reset_mock()
+            self.metadata_tool.return_value = json.dumps({'success':True,'saved':False,'after':{**self.snapshot,'parameters':parameters}})
+            with patch.object(data.LcscClient, 'get_product', return_value=self.component):
+                result = self.apply(allow_package_mismatch=True)
+            self.assertFalse(result['success'])
+            self.assertFalse(result['may_have_partial_changes'])
+            self.assertEqual(result['conflicts'][0]['field'], 'MF')
+            self.assertEqual(result['identity_check']['mpn']['status'], 'match')
+            self.assertEqual(self.metadata_tool.await_count, 1)
+
+    def test_package_conflict_blocks_and_explicit_override_preserves_core_values(self):
+        snapshot = {**self.snapshot, 'parameters':{**self.snapshot['parameters'],'Package':'SOT-23'}}
+        read = {'success':True,'saved':False,'after':snapshot}
+        self.metadata_tool.return_value = json.dumps(read)
+        with patch.object(data.LcscClient, 'get_product', return_value=self.component):
+            result = self.apply()
+        self.assertFalse(result['success'])
+        self.assertTrue(result['identity_verified'])
+        self.assertTrue(result['package_conflict'])
+        self.assertEqual(result['package_check']['symbol'], 'SOT-23')
+        self.assertEqual(result['package_check']['catalog'], 'SO-8-EP')
+        self.assertEqual(self.metadata_tool.await_count, 1)
+        self.metadata_tool.reset_mock()
+        self.metadata_tool.side_effect = [json.dumps(read), json.dumps({'success':True,'saved':False,'after':snapshot})]
+        with patch.object(data.LcscClient, 'get_product', return_value=self.component):
+            result = self.apply(allow_package_mismatch=True)
+        self.assertTrue(result['success'])
+        self.assertTrue(result['package_mismatch_allowed'])
+        self.assertEqual(result['warnings'][0]['code'], 'package_mismatch_allowed')
+        fields = self.metadata_tool.await_args.kwargs['parameters']
+        self.assertNotIn('Package', fields)
+        self.assertNotIn('MP', fields)
+        self.assertNotIn('MF', fields)
+
+    def test_unknown_packages_are_explicit_and_duplicates_always_block(self):
+        for parameters, package, expected in (({'MP':self.component['mpn'],'MF':'TI'},'SO-8-EP','symbol_missing'),
+                                               (self.snapshot['parameters'],'','catalog_missing')):
+            component = {**self.component,'package':package}
+            snapshot = {**self.snapshot,'parameters':parameters}
+            report = data.check_target(snapshot, component)
+            self.assertEqual(report['package_check']['status'], expected)
+            self.assertEqual(report['warnings'][0]['code'], 'package_unverified')
+        snapshot = {**self.snapshot,'parameters':{**self.snapshot['parameters'],'package':'SO-8-EP'}}
+        with self.assertRaises(data.LcscTargetConflict):
+            data.check_target(snapshot, self.component, True)
+
+    def test_provenance_date_and_regional_status_are_supplier_fields(self):
+        fields = data.library_parameters(self.component)
+        self.assertEqual(fields['LCSC Source URL'], self.component['source_url'])
+        self.assertEqual(fields['LCSC Data Source'], 'lcsc_detail_api')
+        self.assertEqual(fields['LCSC Fetched At'], self.component['fetched_at'])
+        self.assertEqual(fields['LCSC Sales Status'], 'unknown')
+        self.assertEqual(fields['LCSC Sales Region'], 'international')
+        self.assertEqual(json.loads(fields['LCSC Sales Status Evidence']), {})
+        updated = data.component_from_payload(payload(isForeignOnsale=False, stockNumber=100, productCycle='normal'))
+        fields = data.library_parameters(updated)
+        self.assertEqual(fields['LCSC Sales Status'], 'not_for_sale')
+        self.assertEqual(fields['LCSC Lifecycle Raw'], 'normal')
+        self.assertEqual(json.loads(fields['LCSC Sales Status Evidence'])['isForeignOnsale'], False)
+
+    def test_manufacturer_and_package_normalization_are_conservative(self):
+        snapshot = {**self.snapshot,'parameters':{**self.snapshot['parameters'],'Package':'so - 8 - ep'}}
+        self.assertTrue(data.check_target(snapshot, self.component)['identity_verified'])
+        for changes in ({'manufacturer':''},{'mpn':'LMR16030SDDA'}):
+            with self.assertRaises(data.LcscTargetConflict):
+                data.check_target(self.snapshot, {**self.component,**changes}, True)
+        with patch.object(data.LcscClient, 'get_product') as get:
+            self.assertFalse(self.apply(allow_package_mismatch='true')['success'])
+            get.assert_not_called()
 
     def test_bad_target_or_catalog_failure_never_reaches_altium(self):
         with patch.object(data.LcscClient, "get_product") as get:

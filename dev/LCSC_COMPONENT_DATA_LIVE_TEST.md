@@ -1,5 +1,9 @@
 # LCSC data live verification
 
+Historical record of the original 15-field, MP-only implementation. Current
+manufacturer/package guards and provenance fields are documented in
+[strict application validation](LCSC_APPLICATION_LIVE_TEST.md).
+
 Verified on 2026-11-04 with the real LCSC catalog and the user's running Altium
 session. The final run completed 18 calls against current Python tool functions
 and a fresh copy of the production script project through the normal bridge.

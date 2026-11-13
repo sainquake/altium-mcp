@@ -35,6 +35,14 @@ class LcscNotFound(LcscError):
     """The detail endpoint returned no identity-bearing product."""
 
 
+class LcscTargetConflict(ValueError):
+    """A symbol/card mismatch, carrying all preflight evidence without writes."""
+
+    def __init__(self, message, report):
+        super().__init__(message)
+        self.report = report
+
+
 def validate_text(value, label, optional=False):
     if (not isinstance(value, str) or len(value) > 256 or any(ord(c) < 32 for c in value)
             or (not optional and not value.strip())):
@@ -206,7 +214,15 @@ def library_parameters(component):
               "LCSC Package": component["package"], "LCSC Datasheet URL": component["datasheet_url"],
               "LCSC Stock": component["stock"], "LCSC MOQ": component["moq"],
               "LCSC Requested Qty": component["requested_qty"], "LCSC Order Qty": component["order_qty"],
-              "LCSC Currency": component["currency"]}
+              "LCSC Currency": component["currency"],
+              "LCSC Source URL": component.get("source_url", ""),
+              "LCSC Data Source": component.get("data_source", ""),
+              "LCSC Fetched At": component.get("fetched_at", ""),
+              "LCSC Sales Status": component.get("sales_status", "unknown"),
+              "LCSC Sales Region": component.get("sales_region", ""),
+              "LCSC Sales Status Evidence": json.dumps(component.get("sales_status_evidence", {}),
+                                                       sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+              "LCSC Lifecycle Raw": component.get("lifecycle_raw")}
     values = {name: "" if value is None else str(value) for name, value in values.items()}
     for field, key in (("LCSC Unit Price", "unit_price"), ("LCSC Batch Cost", "batch_cost")):
         value = component[key]
@@ -214,10 +230,60 @@ def library_parameters(component):
     return values
 
 
-def check_target(snapshot, component):
-    matches = [value for name, value in snapshot.get("parameters", {}).items() if name.casefold() == "mp"]
-    if len(matches) != 1 or not isinstance(matches[0], str) or matches[0].strip().casefold() != component["mpn"].casefold():
-        raise ValueError("symbol MP must exactly match the selected LCSC manufacturer part number")
+def _target_field(parameters, name, catalog, normalize):
+    values = [value for key, value in parameters.items() if key.casefold() == name.casefold()]
+    symbol = values[0] if len(values) == 1 else None
+    left = normalize(symbol) if isinstance(symbol, str) else ""
+    right = normalize(catalog) if isinstance(catalog, str) else ""
+    if len(values) > 1:
+        status = "ambiguous"
+    elif not left:
+        status = "symbol_missing"
+    elif not right:
+        status = "catalog_missing"
+    else:
+        status = "match" if left == right else "mismatch"
+    return dict(field=name, status=status, symbol=symbol, symbol_values=values, catalog=catalog,
+                normalized_symbol=left, normalized_catalog=right)
+
+
+def _identity_value(value):
+    value = value.strip().casefold()
+    return "" if value in {"", "-", "?", "unknown", "n/a"} else value
+
+
+def check_target(snapshot, component, allow_package_mismatch=False):
+    """Require one matching MP and MF; report packages without guessing aliases."""
+    if type(allow_package_mismatch) is not bool:
+        raise ValueError("allow_package_mismatch must be a boolean")
+    parameters = snapshot.get("parameters")
+    if not isinstance(parameters, dict) or any(not isinstance(key, str) for key in parameters):
+        raise ValueError("symbol parameter snapshot is missing or invalid")
+    checks = {
+        "mpn": _target_field(parameters, "MP", component.get("mpn"), _identity_value),
+        "manufacturer": _target_field(parameters, "MF", component.get("manufacturer"),
+                                      lambda value: manufacturer_key(_identity_value(value))),
+        "package": _target_field(parameters, "Package", component.get("package"),
+                                 lambda value: re.sub(r"\s+", "", _identity_value(value))),
+    }
+    conflicts = [checks[key] for key in ("mpn", "manufacturer") if checks[key]["status"] != "match"]
+    package = checks["package"]
+    if package["status"] == "ambiguous" or (package["status"] == "mismatch" and not allow_package_mismatch):
+        conflicts.append(package)
+    warnings = []
+    if package["status"] in {"symbol_missing", "catalog_missing"}:
+        warnings.append(dict(code="package_unverified", **package))
+    elif package["status"] == "mismatch" and allow_package_mismatch:
+        warnings.append(dict(code="package_mismatch_allowed", **package))
+    report = dict(identity_check=checks, package_check=package, conflicts=conflicts, warnings=warnings,
+                  identity_verified=not any(checks[k]["status"] != "match" for k in ("mpn", "manufacturer")),
+                  package_conflict=package["status"] == "mismatch",
+                  package_mismatch_allowed=package["status"] == "mismatch" and allow_package_mismatch)
+    if conflicts:
+        message = "; ".join(f"{row['field']} {row['status']}: symbol={row['symbol_values']!r}, catalog={row['catalog']!r}"
+                            for row in conflicts)
+        raise LcscTargetConflict("LCSC target preflight failed: " + message, report)
+    return report
 
 
 class LcscClient:

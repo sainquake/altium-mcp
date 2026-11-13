@@ -53,6 +53,7 @@ import library_validation
 import library_roundtrip
 import footprint_editor
 import footprint_model3d
+import pcb_component_properties
 import project_selection
 import lcsc_catalog
 from server_info import capture_runtime_info
@@ -177,7 +178,7 @@ MUTATING_COMMANDS = {
     "set_library_component_data", "update_symbol_primitives", "remove_empty_library_component", "set_library_view", "verify_library_roundtrip", "create_document", "open_document", "save_document",
     "add_document_to_project", "open_project", "select_project", "close_document", "clone_schematic_components",
     "set_footprint_pad_settings", "edit_footprint_primitives", "set_footprint_properties", "set_footprint_pad_properties", "edit_footprint_model3d",
-    "set_schematic_sheet_properties", "save_project", "edit_sheet_symbols", "draw_block_diagram",
+    "set_schematic_sheet_properties", "save_project", "edit_sheet_symbols", "draw_block_diagram", "set_pcb_component_properties",
 }
 
 # Present while a script the MCP launched is stuck (paused in Altium's
@@ -2720,32 +2721,47 @@ async def get_lcsc_component_info(ctx: Context, query: str = "", qty: int = 1, l
 
 @_tool()
 async def set_library_component_lcsc_data(ctx: Context, library_path: str, symbol_name: str,
-                                         lcsc_id: str, qty: int = 1) -> str:
+                                         lcsc_id: str, qty: int = 1, allow_package_mismatch: bool = False) -> str:
     """Fill LCSC/JLCPCB fields on an exact existing SchLib symbol after creation.
 
     Fetches a fresh detail card for an exact C-number, then requires the symbol's
-    MP to match that card's MPN (case-insensitive). Upserts only supplier fields
-    through set_library_component_data, with its native preflight and readback.
+    unique nonempty MP and MF to match the card's full MPN and manufacturer.
+    MPN preserves punctuation/suffixes; manufacturer uses the lookup's documented
+    case/spacing/brand aliases. Missing/ambiguous identities fail before writing.
+    Package is compared with case/whitespace normalization only. A known conflict
+    blocks by default and reports both values. allow_package_mismatch=True permits
+    only that conflict and returns a warning; it never bypasses MP/MF checks.
+    Missing package data remains explicitly unverified; duplicate Package fields
+    block. Core Package/MF/MP and model bindings are never corrected or replaced.
+    Upserts supplier fields plus source URL/type, UTC fetched-at, sales status,
+    region, raw lifecycle and status evidence via set_library_component_data.
+    A fresh timestamp can make an otherwise identical refresh changed=True.
     Does not change core parameters, Comment, native Description, models or geometry;
-    never creates Pacage, edits placed components or saves a document. Repeated
-    identical data reuses the fields. Do not edit the symbol concurrently.
+    never creates Pacage, edits placed components or saves a document. Existing
+    supplier parameter names are reused. Do not edit the symbol concurrently.
     """
     try:
         lcsc_id = lcsc_catalog.validate_code(lcsc_id)
         lcsc_catalog.validate_quantity(qty)
+        if type(allow_package_mismatch) is not bool:
+            raise ValueError("allow_package_mismatch must be a boolean")
         library_component_data.prepare_request(library_path, symbol_name, None, None, None, None)
         component = await asyncio.to_thread(lcsc_catalog.LcscClient().get_product, lcsc_id, qty)
         current = json.loads(await set_library_component_data(ctx, library_path, symbol_name))
         if not current.get("success"):
             return json.dumps(current, ensure_ascii=False)
-        lcsc_catalog.check_target(current["after"], component)
+        checks = lcsc_catalog.check_target(current["after"], component, allow_package_mismatch)
         parameters = lcsc_catalog.library_parameters(component)
+    except lcsc_catalog.LcscTargetConflict as exc:
+        return json.dumps({"success": False, "error": str(exc), "saved": False,
+                           "may_have_partial_changes": False, "lcsc_id": lcsc_id, **exc.report}, ensure_ascii=False)
     except (ValueError, TypeError, OSError, lcsc_catalog.LcscError) as exc:
         return json.dumps({"success": False, "error": str(exc), "saved": False, "may_have_partial_changes": False}, ensure_ascii=False)
     result = json.loads(await set_library_component_data(ctx, library_path, symbol_name, parameters=parameters))
     result["lcsc_id"] = component["lcsc_id"]
     result["lcsc_fetched_at"] = component["fetched_at"]
     result["lcsc_parameter_names"] = list(parameters)
+    result.update(checks)
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 
@@ -3522,6 +3538,34 @@ async def create_net_class(ctx: Context, class_name: str, net_names: list) -> st
     logger.info(f"Net class '{class_name}' created/modified successfully")
     return json.dumps(result, indent=2)
     
+@_tool()
+async def set_pcb_component_properties(ctx: Context, pcb_path: str, designators: list,
+                                       component_kind: Optional[str] = None, graphical: Optional[bool] = None,
+                                       include_in_bom: Optional[bool] = None, include_in_pick_place: Optional[bool] = None) -> str:
+    """Read/set native type of placed components in one exact PcbDoc; never save.
+
+    Explicit absolute saved/open named unsaved PCB path; PcbLib targets refused.
+    designators: 1..1000 distinct exact names, case-insensitive, no wildcards.
+    Omit edits to read. component_kind accepts standard, mechanical, graphical,
+    net_tie_bom, net_tie_no_bom, standard_no_bom or their UI labels. graphical=True
+    selects Graphical; False resets a Graphical component to Standard, otherwise
+    retaining a matching current type. BOM/Pick & Place booleans are constraints
+    on the native kind, not independent flags or custom parameters. Retain a
+    matching current kind, otherwise require a unique non-net-tie type; ambiguous
+    or contradictory constraints fail before any component changes. Omitted
+    inclusion fields follow the chosen kind. Standard (No BOM) Pick & Place is
+    null/depends_on_output_settings; no output settings or variants are edited.
+    For M08 use graphical=True, include_in_bom=False, include_in_pick_place=False.
+    All targets preflighted; one undo group; no-op preserves Modified. Preserves
+    pose, footprint/source links, locks and children. Returns native kind and
+    type-policy eligibility, before/after snapshots and disk/readback checks;
+    actual BOM/Pick & Place exports are not generated/verified. Inspect
+    may_have_partial_changes/outcome_unknown before retrying.
+    """
+    return await pcb_component_properties.execute(altium_bridge, EXCHANGE_DIR, pcb_path, designators,
+                                                   component_kind, graphical, include_in_bom, include_in_pick_place)
+
+
 @_tool()
 async def set_component_position(ctx: Context, cmp_designator: str, x: float, y: float, rotation: float = -1) -> str:
     """
